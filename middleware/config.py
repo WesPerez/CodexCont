@@ -43,10 +43,17 @@ class AuthCfg:
 @dataclass(frozen=True)
 class ContinueCfg:
     enabled: bool = True
+    # Empty = fold all models; otherwise only fold models whose name starts
+    # with one of these prefixes. Non-matching models remain pure passthrough.
+    model_prefixes: tuple[str, ...] = ()
     truncation_step: int = 518
     max_continue: int = 8  # hard round cap after round 1 (primary runaway guard)
     min_n: int = 1  # continue only when truncation tier n >= min_n
     max_n: int = 0  # 0 = no cap; else stop forcing once n > max_n
+    retry_low_reasoning_after_continue: bool = False
+    # Only used after this middleware has already forced a continuation. If the
+    # next round ends cleanly but reasoning is still at/below this value, retry.
+    min_continue_reasoning_tokens: int = 0
     method: str = "commentary"  # continuation provocation: "commentary" (default) | "tool_pair"
     marker_text: str = "Continue thinking..."  # commentary path: assistant message text
     forward_marker: bool = False  # commentary path: emit the marker downstream so the agent
@@ -112,6 +119,8 @@ def load_config(path: str | Path) -> Config:
     # listen_paths is a list in TOML; store as tuple.
     if "listen_paths" in server and isinstance(server["listen_paths"], list):
         server = {**server, "listen_paths": tuple(server["listen_paths"])}
+    if "model_prefixes" in cont and isinstance(cont["model_prefixes"], list):
+        cont = {**cont, "model_prefixes": tuple(str(x) for x in cont["model_prefixes"])}
 
     # [upstream.headers] is a nested table under [upstream].
     up_headers = upstream.get("headers") or {}

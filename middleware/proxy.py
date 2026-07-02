@@ -317,6 +317,7 @@ async def fold_stream(
 
     response = first_response
     round_no = 0
+    continued_before = False
 
     try:
         while True:
@@ -402,23 +403,39 @@ async def fold_stream(
                 first_usage = usage
             rt = reasoning_tokens(usage)
             n = tier_n(rt, cont.truncation_step)
-            rounds_info.append({"round": round_no, "reasoning_tokens": rt, "n": n})
             has_enc = bool(round_reasoning and round_reasoning[-1].get("encrypted_content"))
             within_caps = cont.max_total_output_tokens == 0 or (
                 total_usage.get("output_tokens", 0) < cont.max_total_output_tokens
             )
+            buffered = [e["itype"] for e in out_buffer]
+            has_buffered_tool = any(t != "message" for t in buffered)
+            truncation_continue = should_continue(
+                rt, min_n=cont.min_n, max_n=cont.max_n, step=cont.truncation_step
+            )
+            low_reasoning_retry = (
+                cont.retry_low_reasoning_after_continue
+                and continued_before
+                and rt is not None
+                and rt <= cont.min_continue_reasoning_tokens
+                and not has_buffered_tool
+            )
+            continue_reason = (
+                "truncation" if truncation_continue
+                else "low_reasoning_after_continue" if low_reasoning_retry
+                else None
+            )
             do_continue = (
                 cont.enabled
                 and saw_terminal
-                and should_continue(rt, min_n=cont.min_n, max_n=cont.max_n, step=cont.truncation_step)
+                and continue_reason is not None
                 and has_enc
                 and round_no <= cont.max_continue
                 and within_caps
             )
 
-            # If we stop while STILL on the 518n-2 pattern, which guard fired (#5).
+            # If a continuation candidate stops, record which guard fired (#5).
             stopped_reason = None
-            if not do_continue and is_truncation_pattern(rt, cont.truncation_step):
+            if not do_continue and (is_truncation_pattern(rt, cont.truncation_step) or low_reasoning_retry):
                 if not has_enc:
                     stopped_reason = "no_encrypted_content"
                 elif round_no > cont.max_continue:
@@ -428,18 +445,25 @@ async def fold_stream(
                 else:
                     stopped_reason = "tier_out_of_window"
 
-            buffered = [e["itype"] for e in out_buffer]
             decision = (
-                "continue" if do_continue
+                f"continue:{continue_reason}" if do_continue
                 else "upstream_eof" if not saw_terminal
                 else stopped_reason or "clean"
             )
+            rounds_info.append({
+                "round": round_no,
+                "reasoning_tokens": rt,
+                "n": n,
+                "has_encrypted_content": has_enc,
+                "decision": decision,
+            })
             log.info("round %d: %s | n=%s buffered=%s -> %s",
                      round_no, _fmt_usage(usage), n, buffered or "[]", decision)
 
             await response.aclose()
 
             if do_continue:
+                continued_before = True
                 last_id = round_reasoning[-1].get("id") or ""
                 if cont.method == "commentary":
                     marker_items = [commentary_message(cont.marker_text)]

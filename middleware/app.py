@@ -71,6 +71,13 @@ def _url_is_from_header(cfg: Config, request: Request) -> bool:
     return cfg.upstream.mode in ("header", "header_required") and _header_base(request) is not None
 
 
+def _model_allowed_to_fold(cfg: Config, model: Any) -> bool:
+    prefixes = cfg.cont.model_prefixes
+    if not prefixes:
+        return True
+    return isinstance(model, str) and model.startswith(prefixes)
+
+
 async def _passthrough(
     client: httpx.AsyncClient, cfg: Config, request: Request, raw: bytes, url: str
 ):
@@ -135,16 +142,19 @@ async def handle_responses(request: Request) -> Response:
         cfg.cont.method == "tool_pair"
         and declares_continue_tool(body, cfg.cont.continue_tool_name)
     )
+    model_allowed = _model_allowed_to_fold(cfg, body.get("model"))
     should_fold = (
         cfg.cont.enabled
         and bool(body.get("stream"))
         and reasoning_enabled(body)
+        and model_allowed
         and not collision
     )
     if not should_fold:
         why = ("disabled" if not cfg.cont.enabled
                else "non-stream" if not body.get("stream")
                else "non-reasoning" if not reasoning_enabled(body)
+               else "model-not-matched" if not model_allowed
                else "declares-continue_thinking")
         log.info("passthrough (%s): model=%s path=%s url=%s",
                  why, body.get("model"), request.url.path, url)

@@ -18,7 +18,12 @@ sys.path.insert(0, str(ROOT))
 
 from starlette.datastructures import Headers
 
-from middleware.app import _make_client, _resolve_upstream_url, _url_is_from_header
+from middleware.app import (
+    _make_client,
+    _model_allowed_to_fold,
+    _resolve_upstream_url,
+    _url_is_from_header,
+)
 from middleware.codex import (
     continue_call_id,
     is_truncation_pattern,
@@ -376,6 +381,70 @@ async def test_forward_marker_emits_downstream():
           seqs == list(range(len(evs))), str(seqs[:6]))
 
 
+async def test_low_reasoning_retry_after_continue():
+    base = load_config(ROOT / "config.toml")
+    base_body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "q"}]}
+
+    disabled = replace(
+        base,
+        cont=replace(
+            base.cont,
+            retry_low_reasoning_after_continue=False,
+            min_continue_reasoning_tokens=256,
+            max_continue=3,
+        ),
+    )
+    r1 = FakeResp(_round("rs_a", "ENC_A", 516, msg="truncated"))
+    r2 = FakeResp(_round("rs_b", "ENC_B", 0, msg="wrong"))
+    r3 = FakeResp(_round("rs_c", "ENC_C", 300, msg="recovered"))
+    client = FakeClient([r2, r3])
+    evs = [e for e in await run_fold_capture(disabled, base_body, r1, client)
+           if isinstance(e, dict)]
+    deltas = "".join(e.get("delta", "") for e in evs
+                     if e.get("type") == "response.output_text.delta")
+    check("low-reasoning retry disabled stops on clean low round", deltas == "wrong", deltas)
+    check("low-reasoning retry disabled opened one continuation", len(client.payloads) == 1,
+          str(len(client.payloads)))
+
+    enabled = replace(
+        base,
+        cont=replace(
+            base.cont,
+            retry_low_reasoning_after_continue=True,
+            min_continue_reasoning_tokens=256,
+            max_continue=3,
+        ),
+    )
+    r1 = FakeResp(_round("rs_a", "ENC_A", 516, msg="truncated"))
+    r2 = FakeResp(_round("rs_b", "ENC_B", 0, msg="wrong"))
+    r3 = FakeResp(_round("rs_c", "ENC_C", 300, msg="recovered"))
+    client = FakeClient([r2, r3])
+    evs = [e for e in await run_fold_capture(enabled, base_body, r1, client)
+           if isinstance(e, dict)]
+    deltas = "".join(e.get("delta", "") for e in evs
+                     if e.get("type") == "response.output_text.delta")
+    check("low-reasoning retry enabled discards low round", deltas == "recovered", deltas)
+    check("low-reasoning retry enabled opened two continuations", len(client.payloads) == 2,
+          str(len(client.payloads)))
+    md = (evs[-1].get("response") or {}).get("metadata") or {}
+    decisions = [r.get("decision") for r in (md.get("proxy_rounds") or [])]
+    check("low-reasoning retry decision recorded",
+          "continue:low_reasoning_after_continue" in decisions, str(decisions))
+
+    r1 = FakeResp(_round("rs_a", "ENC_A", 516, msg="truncated"))
+    tool = {"id": "fc_low", "type": "function_call", "name": "shell", "call_id": "call_low",
+            "arguments": "{\"cmd\":\"pwd\"}"}
+    r2 = FakeResp(_round("rs_b", "ENC_B", 0, extra_items=[tool]))
+    r3 = FakeResp(_round("rs_c", "ENC_C", 300, msg="should-not-open"))
+    client = FakeClient([r2, r3])
+    evs = [e for e in await run_fold_capture(enabled, base_body, r1, client)
+           if isinstance(e, dict)]
+    has_fc = any((e.get("item") or {}).get("type") == "function_call" for e in evs)
+    check("low-reasoning retry does not discard tool calls", has_fc)
+    check("low-reasoning retry opened no extra continuation for tool call",
+          len(client.payloads) == 1, str(len(client.payloads)))
+
+
 # --- 2-fix. header transparency (#2) ----------------------------------------
 
 
@@ -536,6 +605,17 @@ def test_reasoning_gate():
     check("reasoning_enabled explicit false → false", not reasoning_enabled({"reasoning": False}))
 
 
+def test_model_prefix_gate():
+    cfg = load_config(ROOT / "config.toml")
+    unrestricted = replace(cfg, cont=replace(cfg.cont, model_prefixes=()))
+    gpt_only = replace(cfg, cont=replace(cfg.cont, model_prefixes=("gpt-",)))
+
+    check("model gate empty allows all", _model_allowed_to_fold(unrestricted, "claude-sonnet-4"))
+    check("model gate gpt allows gpt", _model_allowed_to_fold(gpt_only, "gpt-5.5"))
+    check("model gate gpt rejects non-gpt", not _model_allowed_to_fold(gpt_only, "claude-sonnet-4"))
+    check("model gate gpt rejects missing model", not _model_allowed_to_fold(gpt_only, None))
+
+
 # --- 3-fix. stateful follow-up repair (#3) ----------------------------------
 
 
@@ -622,11 +702,13 @@ async def _main():
     await test_commentary_continuation_payload()
     await test_tool_pair_continuation_payload()
     await test_forward_marker_emits_downstream()
+    await test_low_reasoning_retry_after_continue()
     test_header_transparency()
     test_upstream_url_resolution()
     test_auth_safety_guard()
     test_auth_injection()
     test_reasoning_gate()
+    test_model_prefix_gate()
     test_stateful_repair()
     await test_eof_incomplete()
 

@@ -17,10 +17,13 @@ chatgpt_account_id = ""            # chatgpt-account-id; Codex needs it, empty =
 
 [continue]
 enabled = true
+model_prefixes = []                # empty = all models; e.g. ["gpt-"] folds only GPT models
 truncation_step = 518
 max_continue = 3                   # hard round cap after round 1 (primary runaway guard)
 min_n = 1                          # only continue when truncation tier n >= min_n
 max_n = 6                          # 0 = no cap; else stop forcing once n > max_n
+retry_low_reasoning_after_continue = false # after a forced continue, retry clean rounds with very low reasoning
+min_continue_reasoning_tokens = 0   # threshold for the low-reasoning retry; 0 catches zero-reasoning stalls
 method = "commentary"              # continuation provocation method:
                                    #   "commentary" (default) = ONE phase:"commentary" assistant
                                    #     message (clean; an official Responses-API field). Verified
