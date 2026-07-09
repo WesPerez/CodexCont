@@ -18,6 +18,7 @@ class ServerCfg:
     listen_paths: tuple[str, ...] = (
         "/backend-api/codex/responses",
         "/v1/responses",
+        "/responses",
     )
 
 
@@ -96,6 +97,14 @@ class RequestLogCfg:
     # Bodies above this size are stored as a compressed prefix and marked
     # truncated; structured summaries are still computed from the parsed body.
     max_body_bytes: int = 8 * 1024 * 1024
+    # Remove audit rows older than this many days. 0 disables automatic pruning.
+    retention_days: int = 7
+    # Also store the exact body sent upstream after compatibility transforms.
+    store_forwarded_body: bool = True
+    # Response-body capture: off | errors | all. Streaming bodies are capped by
+    # max_response_body_bytes and stored compressed.
+    store_response_body: str = "errors"
+    max_response_body_bytes: int = 1024 * 1024
     # Preview characters for short fields such as function_call.arguments.
     # Set to 0 to store only length/hash/type.
     preview_chars: int = 240
@@ -103,9 +112,22 @@ class RequestLogCfg:
 
 @dataclass(frozen=True)
 class CompatCfg:
-    # Convert call-like input items whose `arguments` field is a JSON object
-    # encoded as a string into a real object before forwarding upstream.
+    # Normalize selected historical call item argument shapes before forwarding.
+    # function_call targets JSON string; tool_search_call targets JSON object.
     normalize_input_arguments: bool = False
+    normalize_input_argument_item_types: tuple[str, ...] = ("function_call", "tool_search_call")
+    # Synthesize stable ids for historical web_search_call items that are missing
+    # the Responses-required `id`. None preserves the previous behavior: follow
+    # normalize_input_arguments. Set true/false to control it independently.
+    synthesize_web_search_call_ids: bool | None = None
+    # How to handle top-level max_output_tokens when an upstream rejects that
+    # standard Responses field: keep | drop | rename_to_max_tokens.
+    max_output_tokens_compat: str = ""
+    # Backward-compatible alias. Prefer max_output_tokens_compat="drop".
+    drop_max_output_tokens: bool = False
+    # How to handle reasoning.effort for upstream variants:
+    # keep | minimal_to_none.
+    reasoning_effort_compat: str = ""
 
 
 @dataclass(frozen=True)
@@ -155,6 +177,16 @@ def load_config(path: str | Path) -> Config:
         server = {**server, "listen_paths": tuple(server["listen_paths"])}
     if "model_prefixes" in cont and isinstance(cont["model_prefixes"], list):
         cont = {**cont, "model_prefixes": tuple(str(x) for x in cont["model_prefixes"])}
+    if (
+        "normalize_input_argument_item_types" in compat
+        and isinstance(compat["normalize_input_argument_item_types"], list)
+    ):
+        compat = {
+            **compat,
+            "normalize_input_argument_item_types": tuple(
+                str(x) for x in compat["normalize_input_argument_item_types"]
+            ),
+        }
 
     # [upstream.headers] is a nested table under [upstream].
     up_headers = upstream.get("headers") or {}

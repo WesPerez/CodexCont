@@ -1,7 +1,7 @@
 [server]
 host = "127.0.0.1"
 port = 8787
-listen_paths = ["/v1/responses"]
+listen_paths = ["/v1/responses", "/responses"]
 
 [upstream]
 url = "https://chatgpt.com/backend-api/codex/responses"
@@ -63,8 +63,16 @@ enabled = false                    # write structured request-body audit records
 path = "logs/request_audit.sqlite3" # relative paths resolve from config.toml's directory
 store_body = true                  # store original request body as compressed bytes
 max_body_bytes = 8388608           # larger bodies are stored as a compressed prefix and marked truncated
+retention_days = 7                 # automatically prune audit rows older than this many days; 0 = keep forever
+store_forwarded_body = true        # also store the actual body sent upstream after compatibility transforms
+store_response_body = "errors"     # off | errors | all; streaming responses are stored as capped compressed prefixes
+max_response_body_bytes = 1048576  # cap per stored upstream/downstream response body
 preview_chars = 240                # short previews for fields like input[i].arguments; 0 = hash/length only
 
 [compat]
-normalize_input_arguments = false  # convert call-like input[i].arguments from JSON-object strings
-                                   # to objects before forwarding; original bytes remain in audit DB
+normalize_input_arguments = false  # normalize selected input[i].arguments before forwarding:
+                                   # function_call object -> JSON string; tool_search_call JSON string -> object
+normalize_input_argument_item_types = ["function_call", "tool_search_call"]
+synthesize_web_search_call_ids = false # synthesize stable ids for historical web_search_call items missing id
+max_output_tokens_compat = "keep"  # keep | rename_to_max_tokens | drop (drop removes max_output_tokens and max_tokens)
+reasoning_effort_compat = "keep"   # keep | minimal_to_none

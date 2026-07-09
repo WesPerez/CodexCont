@@ -11,7 +11,9 @@ import json
 import sqlite3
 import sys
 import tempfile
+import zlib
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,7 +28,7 @@ from middleware.app import (
     _resolve_upstream_url,
     _url_is_from_header,
 )
-from middleware.audit import RequestAuditStore
+from middleware.audit import AuditBodyCapture, RequestAuditStore
 from middleware.codex import (
     continue_call_id,
     is_truncation_pattern,
@@ -345,10 +347,32 @@ async def test_commentary_continuation_payload():
     rA = FakeResp(_round("rs_a", "ENC_A", 516, msg="trunc"))  # truncated → continue
     rB = FakeResp(_round("rs_b", "ENC_B", 999, msg="done"))   # clean → stop
     client = FakeClient([rB])
-    evs = [e for e in await run_fold_capture(cfg, base_body, rA, client) if isinstance(e, dict)]
+    audited_payloads: list[tuple[int, dict]] = []
+
+    async def audit_upstream_request(round_no: int, body_bytes: bytes) -> None:
+        audited_payloads.append((round_no, json.loads(body_bytes)))
+
+    out = b""
+    async for chunk in fold_stream(
+        client,
+        cfg,
+        base_body,
+        {},
+        rA,
+        audit_upstream_request_body=audit_upstream_request,
+    ):
+        out += chunk
+    evs = [e for e in await parse_events(out) if isinstance(e, dict)]
 
     check("commentary: one continuation round opened", len(client.payloads) == 1,
           str(len(client.payloads)))
+    check("commentary: continuation request audited",
+          len(audited_payloads) == 1 and audited_payloads[0][0] == 2,
+          str(audited_payloads))
+    if audited_payloads and client.payloads:
+        check("commentary: audited continuation matches forwarded payload",
+              audited_payloads[0][1] == client.payloads[0],
+              str(audited_payloads[0][1]))
     inp = (client.payloads[0].get("input") if client.payloads else []) or []
     last = inp[-1] if inp else {}
     check("commentary: marker is a phase:commentary assistant message",
@@ -381,6 +405,51 @@ async def test_tool_pair_continuation_payload():
           "function_call" in types and "function_call_output" in types, str(types))
     check("tool_pair: no commentary message in replay",
           not any(isinstance(x, dict) and x.get("phase") == "commentary" for x in inp))
+
+
+async def test_fold_upstream_response_capture_callback():
+    cfg = load_config(ROOT / "config.toml")
+    base_body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "q"}]}
+    resp = FakeResp(_round("rs_cap", "ENC_CAP", 999, msg="done"))
+    client = FakeClient([])
+    captures: list[tuple[int, int | None, int, int, bool]] = []
+
+    def make_capture(round_no: int, status_code: int | None, content_type: str | None):
+        return AuditBodyCapture(12)
+
+    async def audit_capture(
+        round_no: int,
+        status_code: int | None,
+        content_type: str | None,
+        capture: AuditBodyCapture,
+    ) -> None:
+        captures.append((
+            round_no,
+            status_code,
+            capture.original_bytes,
+            capture.stored_bytes,
+            capture.truncated,
+        ))
+
+    out = b""
+    async for chunk in fold_stream(
+        client,
+        cfg,
+        base_body,
+        {},
+        resp,
+        make_upstream_response_capture=make_capture,
+        audit_upstream_response_capture=audit_capture,
+    ):
+        out += chunk
+    await parse_events(out)
+    check("fold captures upstream response body prefix",
+          len(captures) == 1
+          and captures[0][0] == 1
+          and captures[0][1] == 200
+          and captures[0][2] > captures[0][3] == 12
+          and captures[0][4],
+          str(captures))
 
 
 async def test_forward_marker_emits_downstream():
@@ -670,7 +739,16 @@ def test_request_audit_store_records_schema():
                     "type": "function_call",
                     "name": "exec_command",
                     "call_id": "call_1",
-                    "arguments": "{\"cmd\":\"ls\"}",
+                    "arguments": {"cmd": "ls"},
+                },
+                {
+                    "type": "tool_search_call",
+                    "arguments": "{\"query\":\"compat\"}",
+                },
+                {
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {"type": "search", "query": "compat"},
                 },
                 {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
             ],
@@ -694,6 +772,22 @@ def test_request_audit_store_records_schema():
         store.update_response(audit_id, upstream_status_code=502, downstream_status_code=502)
         compat = normalize_request_body(body, CompatCfg(normalize_input_arguments=True))
         store.record_compat_actions(audit_id, compat.actions)
+        store.record_body(
+            audit_id,
+            stage="upstream_request_body",
+            ordinal=1,
+            body=json.dumps(compat.body, ensure_ascii=False).encode(),
+            content_type="application/json",
+        )
+        response_capture = AuditBodyCapture(10)
+        response_capture.add(b"0123456789abcdef")
+        store.record_captured_body(
+            audit_id,
+            stage="upstream_response_body",
+            ordinal=1,
+            capture=response_capture,
+            content_type="text/event-stream",
+        )
         store.close()
 
         conn = sqlite3.connect(Path(tmp) / "audit.sqlite3")
@@ -702,9 +796,38 @@ def test_request_audit_store_records_schema():
             "select * from request_audit where id = ?", (audit_id,)
         ).fetchone()
         check("audit request row inserted", req is not None)
-        check("audit input_count", req["input_count"] == 3, str(req["input_count"]))
+        check("audit input_count", req["input_count"] == 5, str(req["input_count"]))
         check("audit body stored compressed", req["raw_body_zlib"] is not None)
         check("audit upstream status recorded", req["upstream_status_code"] == 502)
+
+        body_rows = conn.execute(
+            """
+            select stage, ordinal, content_type, body_truncated,
+                   body_original_bytes, body_stored_bytes, body_zlib
+            from request_audit_bodies
+            where audit_id = ?
+            order by stage, ordinal
+            """,
+            (audit_id,),
+        ).fetchall()
+        body_keys = {(row["stage"], row["ordinal"]) for row in body_rows}
+        check("audit stores client request body artifact",
+              ("client_request_body", 0) in body_keys, str(body_keys))
+        check("audit stores forwarded request body artifact",
+              ("upstream_request_body", 1) in body_keys, str(body_keys))
+        check("audit stores upstream response body artifact",
+              ("upstream_response_body", 1) in body_keys, str(body_keys))
+        response_rows = [row for row in body_rows if row["stage"] == "upstream_response_body"]
+        if response_rows:
+            row = response_rows[0]
+            check("audit response artifact truncated",
+                  row["body_truncated"] == 1
+                  and row["body_original_bytes"] == 16
+                  and row["body_stored_bytes"] == 10,
+                  str(dict(row)))
+            check("audit response artifact compressed prefix",
+                  zlib.decompress(row["body_zlib"]) == b"0123456789",
+                  str(zlib.decompress(row["body_zlib"])))
 
         item = conn.execute(
             """
@@ -715,9 +838,9 @@ def test_request_audit_store_records_schema():
             (audit_id,),
         ).fetchone()
         check("audit function_call item row", item["item_type"] == "function_call")
-        check("audit arguments type string", item["arguments_type"] == "string",
+        check("audit arguments type object", item["arguments_type"] == "object",
               str(item["arguments_type"]))
-        check("audit arguments parses object", item["arguments_json_type"] == "object",
+        check("audit object has no parsed JSON type", item["arguments_json_type"] is None,
               str(item["arguments_json_type"]))
 
         findings = conn.execute(
@@ -729,10 +852,12 @@ def test_request_audit_store_records_schema():
             (audit_id,),
         ).fetchall()
         pairs = {(row["path"], row["code"]) for row in findings}
-        check("audit flags input arguments string",
-              ("input[1].arguments", "arguments_string") in pairs, str(pairs))
+        check("audit flags input arguments object",
+              ("input[1].arguments", "arguments_object") in pairs, str(pairs))
         check("audit flags max_output_tokens",
               ("max_output_tokens", "top_level_max_output_tokens") in pairs, str(pairs))
+        check("audit flags web_search_call missing id",
+              ("input[3].id", "web_search_call_missing_id") in pairs, str(pairs))
 
         compat_rows = conn.execute(
             """
@@ -743,15 +868,99 @@ def test_request_audit_store_records_schema():
             """,
             (audit_id,),
         ).fetchall()
-        check("audit records compat action", len(compat_rows) == 1, str(compat_rows))
+        check("audit records compat actions", len(compat_rows) == 3, str(compat_rows))
         if compat_rows:
-            row = compat_rows[0]
-            check("audit compat path",
-                  row["path"] == "input[1].arguments", str(dict(row)))
-            check("audit compat normalized object",
-                  row["action"] == "normalized" and row["parsed_type"] == "object",
-                  str(dict(row)))
+            rows = {row["path"]: row for row in compat_rows}
+            check("audit compat serializes function_call",
+                  rows["input[1].arguments"]["code"] == "serialized_object"
+                  and rows["input[1].arguments"]["parsed_type"] == "string",
+                  str([dict(row) for row in compat_rows]))
+            check("audit compat parses tool_search_call",
+                  rows["input[2].arguments"]["code"] == "parsed_object"
+                  and rows["input[2].arguments"]["parsed_type"] == "object",
+                  str([dict(row) for row in compat_rows]))
+            check("audit compat synthesizes web_search_call id",
+                  rows["input[3].id"]["code"] == "synthesized_web_search_call_id"
+                  and rows["input[3].id"]["parsed_type"] == "string",
+                  str([dict(row) for row in compat_rows]))
         conn.close()
+
+
+def test_request_audit_retention_and_response_modes():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = RequestLogCfg(
+            enabled=True,
+            path="audit.sqlite3",
+            store_body=True,
+            max_body_bytes=128,
+            retention_days=7,
+            store_response_body="errors",
+            max_response_body_bytes=8,
+        )
+        db = Path(tmp) / "audit.sqlite3"
+        store = RequestAuditStore(cfg, Path(tmp))
+        old_id = store.record_request(
+            trace_id="trace_old",
+            request_id="req_old",
+            method="POST",
+            path="/v1/responses",
+            client_host=None,
+            user_agent=None,
+            content_type="application/json",
+            upstream_url="http://upstream/v1/responses",
+            decision="fold",
+            raw_body=b'{"model":"old"}',
+            body={"model": "old"},
+            parse_error=None,
+        )
+        store.close()
+
+        old_ts = (datetime.now(UTC) - timedelta(days=8)).isoformat(timespec="milliseconds")
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "update request_audit set created_at = ?, updated_at = ? where id = ?",
+            (old_ts, old_ts, old_id),
+        )
+        conn.commit()
+        conn.close()
+
+        store = RequestAuditStore(cfg, Path(tmp))
+        new_id = store.record_request(
+            trace_id="trace_new",
+            request_id="req_new",
+            method="POST",
+            path="/v1/responses",
+            client_host=None,
+            user_agent=None,
+            content_type="application/json",
+            upstream_url="http://upstream/v1/responses",
+            decision="fold",
+            raw_body=b'{"model":"new"}',
+            body={"model": "new"},
+            parse_error=None,
+        )
+        check("audit response mode captures errors",
+              store.should_record_response_body(502)
+              and not store.should_record_response_body(200)
+              and store.should_record_response_body(200, force=True)
+              and store.should_capture_response_body(200, force_possible=True))
+        store.close()
+
+        conn = sqlite3.connect(db)
+        old_count = conn.execute(
+            "select count(*) from request_audit where id = ?", (old_id,)
+        ).fetchone()[0]
+        new_count = conn.execute(
+            "select count(*) from request_audit where id = ?", (new_id,)
+        ).fetchone()[0]
+        old_body_count = conn.execute(
+            "select count(*) from request_audit_bodies where audit_id = ?", (old_id,)
+        ).fetchone()[0]
+        conn.close()
+        check("audit retention prunes old request", old_count == 0, str(old_count))
+        check("audit retention keeps new request", new_count == 1, str(new_count))
+        check("audit retention cascades body artifacts",
+              old_body_count == 0, str(old_body_count))
 
 
 def test_compat_normalizes_input_arguments_safely():
@@ -765,21 +974,38 @@ def test_compat_normalizes_input_arguments_safely():
                 "extra": {"keep": True},
             },
             {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": {"cmd": "pwd", "limit": 1},
+            },
+            {
                 "type": "tool_search_call",
                 "arguments": "{\"query\":\"computer use screenshot window\",\"limit\":5}",
             },
-            {"type": "function_call", "arguments": "{\"a\":1,\"a\":2}"},
-            {"type": "function_call", "arguments": "[1,2]"},
-            {"type": "function_call", "arguments": "{\"unterminated\""},
-            {"type": "message", "arguments": "{\"do_not\":\"touch\"}"},
+            {"type": "tool_search_call", "arguments": {"already": "object"}},
+            {"type": "tool_search_call", "arguments": "{\"a\":1,\"a\":2}"},
+            {"type": "tool_search_call", "arguments": "[1,2]"},
+            {"type": "tool_search_call", "arguments": "{\"unterminated\""},
+            {"type": "message", "arguments": {"do_not": "touch"}},
             {
                 "type": "function_call_output",
                 "output": "{\"do_not\":\"touch\"}",
-                "arguments": "{\"also\":\"touch?\"}",
+                "arguments": {"also": "do_not_touch"},
             },
-            {"type": "function_call", "arguments": {"already": "object"}},
             {"type": "function_call", "arguments": 7},
-            {"type": "function_call", "arguments": "{\"ratio\":1.234567890123456789}"},
+            {"type": "tool_search_call", "arguments": 7},
+            {"type": "tool_search_call", "arguments": "{\"ratio\":1.234567890123456789}"},
+            {
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {"type": "search", "query": "compat"},
+            },
+            {
+                "type": "web_search_call",
+                "id": "ws_keep",
+                "status": "completed",
+                "action": {"type": "open_page", "url": "https://example.com"},
+            },
         ],
     }
 
@@ -789,54 +1015,233 @@ def test_compat_normalizes_input_arguments_safely():
     check("compat returns new body when changed", out is not body)
     check("compat original not mutated",
           isinstance(body["input"][0]["arguments"], str), str(body["input"][0]))
-    check("compat function_call args object",
-          out["input"][0]["arguments"] == {"cmd": "ls", "limit": 5},
+    check("compat existing function_call string stays string",
+          out["input"][0]["arguments"] == "{\"cmd\":\"ls\",\"limit\":5}",
           str(out["input"][0]["arguments"]))
-    check("compat tool_search_call args object",
-          out["input"][1]["arguments"] == {
+    check("compat function_call object serialized",
+          out["input"][1]["arguments"] == "{\"cmd\":\"pwd\",\"limit\":1}",
+          str(out["input"][1]["arguments"]))
+    check("compat tool_search_call string parsed",
+          out["input"][2]["arguments"] == {
               "query": "computer use screenshot window",
               "limit": 5,
           },
-          str(out["input"][1]["arguments"]))
+          str(out["input"][2]["arguments"]))
     check("compat preserves sibling fields",
           out["input"][0]["extra"] == {"keep": True}, str(out["input"][0]))
+    check("compat existing tool_search_call object reused",
+          out["input"][3]["arguments"] == {"already": "object"},
+          str(out["input"][3]["arguments"]))
     check("compat duplicate keys skipped",
-          out["input"][2]["arguments"] == "{\"a\":1,\"a\":2}",
-          str(out["input"][2]["arguments"]))
-    check("compat non-object JSON skipped",
-          out["input"][3]["arguments"] == "[1,2]", str(out["input"][3]["arguments"]))
-    check("compat invalid JSON skipped",
-          out["input"][4]["arguments"] == "{\"unterminated\"",
+          out["input"][4]["arguments"] == "{\"a\":1,\"a\":2}",
           str(out["input"][4]["arguments"]))
-    check("compat message arguments untouched",
-          out["input"][5]["arguments"] == "{\"do_not\":\"touch\"}",
-          str(out["input"][5]["arguments"]))
-    check("compat output item arguments untouched",
-          out["input"][6]["arguments"] == "{\"also\":\"touch?\"}",
+    check("compat non-object JSON skipped",
+          out["input"][5]["arguments"] == "[1,2]", str(out["input"][5]["arguments"]))
+    check("compat invalid JSON skipped",
+          out["input"][6]["arguments"] == "{\"unterminated\"",
           str(out["input"][6]["arguments"]))
-    check("compat existing object reused",
-          out["input"][7]["arguments"] == {"already": "object"},
+    check("compat message arguments untouched",
+          out["input"][7]["arguments"] == {"do_not": "touch"},
           str(out["input"][7]["arguments"]))
+    check("compat output item arguments untouched",
+          out["input"][8]["arguments"] == {"also": "do_not_touch"},
+          str(out["input"][8]["arguments"]))
     codes = [(a.path, a.action, a.code) for a in result.actions]
     check("compat action counts",
-          result.changed_count == 2 and result.skipped_count == 5, str(codes))
+          result.changed_count == 3 and result.skipped_count == 6, str(codes))
+    check("compat action function_call serialized",
+          ("input[1].arguments", "normalized", "serialized_object") in codes, str(codes))
+    check("compat action tool_search_call parsed",
+          ("input[2].arguments", "normalized", "parsed_object") in codes, str(codes))
+    check("compat action web_search_call id",
+          ("input[12].id", "normalized", "synthesized_web_search_call_id") in codes,
+          str(codes))
     check("compat action duplicate",
-          ("input[2].arguments", "skipped", "duplicate_keys") in codes, str(codes))
+          ("input[4].arguments", "skipped", "duplicate_keys") in codes, str(codes))
     check("compat action non-object",
-          ("input[3].arguments", "skipped", "non_object_json") in codes, str(codes))
+          ("input[5].arguments", "skipped", "non_object_json") in codes, str(codes))
     check("compat action invalid",
-          ("input[4].arguments", "skipped", "invalid_json") in codes, str(codes))
-    check("compat action unsupported type",
-          ("input[8].arguments", "skipped", "unsupported_argument_type") in codes,
+          ("input[6].arguments", "skipped", "invalid_json") in codes, str(codes))
+    check("compat function_call unsupported type",
+          ("input[9].arguments", "skipped", "unsupported_argument_type") in codes,
+          str(codes))
+    check("compat tool_search_call unsupported type",
+          ("input[10].arguments", "skipped", "unsupported_argument_type") in codes,
           str(codes))
     check("compat floating point skipped",
-          out["input"][9]["arguments"] == "{\"ratio\":1.234567890123456789}"
-          and ("input[9].arguments", "skipped", "floating_point_number") in codes,
+          out["input"][11]["arguments"] == "{\"ratio\":1.234567890123456789}"
+          and ("input[11].arguments", "skipped", "floating_point_number") in codes,
           str(codes))
+    check("compat web_search_call id synthesized",
+          isinstance(out["input"][12].get("id"), str)
+          and out["input"][12]["id"].startswith("ws_12_"),
+          str(out["input"][12]))
+    repeat = normalize_request_body(body, CompatCfg(normalize_input_arguments=True))
+    check("compat web_search_call id stable",
+          repeat.body["input"][12]["id"] == out["input"][12]["id"],
+          str(repeat.body["input"][12]))
+    check("compat web_search_call existing id preserved",
+          out["input"][13]["id"] == "ws_keep", str(out["input"][13]))
 
     disabled = normalize_request_body(body, CompatCfg(normalize_input_arguments=False))
     check("compat disabled returns original body", disabled.body is body)
     check("compat disabled no actions", disabled.actions == ())
+
+    web_only = {
+        "input": [
+            {
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {"type": "search", "query": "compat"},
+            }
+        ]
+    }
+    web_only_result = normalize_request_body(
+        web_only,
+        CompatCfg(synthesize_web_search_call_ids=True),
+    )
+    check("compat can synthesize web_search_call id independently",
+          web_only_result.body["input"][0]["id"].startswith("ws_0_")
+          and web_only_result.changed_count == 1,
+          str(web_only_result.body))
+    web_explicit_disabled = normalize_request_body(
+        web_only,
+        CompatCfg(normalize_input_arguments=True, synthesize_web_search_call_ids=False),
+    )
+    check("compat can disable web_search_call id synthesis explicitly",
+          web_explicit_disabled.body is web_only and web_explicit_disabled.actions == (),
+          str(web_explicit_disabled.actions))
+
+    max_body = {
+        "model": "gpt-5.5",
+        "max_output_tokens": 100,
+        "input": [
+            {
+                "type": "message",
+                "content": [{"type": "input_text", "text": "max_output_tokens stays here"}],
+            }
+        ],
+    }
+    max_result = normalize_request_body(
+        max_body,
+        CompatCfg(
+            normalize_input_arguments=True,
+            max_output_tokens_compat="rename_to_max_tokens",
+        ),
+    )
+    check("compat renames max_output_tokens",
+          "max_output_tokens" not in max_result.body
+          and max_result.body.get("max_tokens") == 100,
+          str(max_result.body))
+    check("compat max_output_tokens original not mutated",
+          max_body["max_output_tokens"] == 100, str(max_body))
+    check("compat max_output_tokens records action",
+          ("max_output_tokens", "normalized", "renamed_max_output_tokens_to_max_tokens")
+          in [(a.path, a.action, a.code) for a in max_result.actions],
+          str([(a.path, a.action, a.code) for a in max_result.actions]))
+
+    drop_max = normalize_request_body(
+        max_body,
+        CompatCfg(normalize_input_arguments=True, max_output_tokens_compat="drop"),
+    )
+    check("compat can explicitly drop max_output_tokens",
+          "max_output_tokens" not in drop_max.body and "max_tokens" not in drop_max.body,
+          str(drop_max.body))
+
+    legacy_max_body = {
+        "model": "gpt-5.5",
+        "max_tokens": 80,
+        "input": [{"role": "user", "content": "ping"}],
+    }
+    drop_legacy_max = normalize_request_body(
+        legacy_max_body,
+        CompatCfg(max_output_tokens_compat="drop"),
+    )
+    check("compat drop also removes legacy max_tokens",
+          "max_output_tokens" not in drop_legacy_max.body
+          and "max_tokens" not in drop_legacy_max.body,
+          str(drop_legacy_max.body))
+    check("compat legacy max_tokens original not mutated",
+          legacy_max_body["max_tokens"] == 80, str(legacy_max_body))
+
+    both_max_body = {
+        "model": "gpt-5.5",
+        "max_output_tokens": 100,
+        "max_tokens": 80,
+        "input": [{"role": "user", "content": "ping"}],
+    }
+    drop_both_max = normalize_request_body(
+        both_max_body,
+        CompatCfg(max_output_tokens_compat="drop"),
+    )
+    drop_both_codes = [(a.path, a.action, a.code) for a in drop_both_max.actions]
+    check("compat drop removes both max token fields",
+          "max_output_tokens" not in drop_both_max.body
+          and "max_tokens" not in drop_both_max.body,
+          str(drop_both_max.body))
+    check("compat drop records both max token fields",
+          ("max_output_tokens", "normalized", "dropped_max_output_tokens") in drop_both_codes
+          and ("max_tokens", "normalized", "dropped_max_tokens") in drop_both_codes,
+          str(drop_both_codes))
+
+    legacy_drop_max = normalize_request_body(
+        max_body,
+        CompatCfg(normalize_input_arguments=True, drop_max_output_tokens=True),
+    )
+    check("compat legacy drop_max_output_tokens still drops",
+          "max_output_tokens" not in legacy_drop_max.body
+          and "max_tokens" not in legacy_drop_max.body,
+          str(legacy_drop_max.body))
+
+    keep_max = normalize_request_body(
+        max_body,
+        CompatCfg(normalize_input_arguments=True),
+    )
+    check("compat keeps max_output_tokens when disabled",
+          keep_max.body is max_body and keep_max.actions == (), str(keep_max.actions))
+
+    minimal_reasoning = {
+        "model": "gpt-5.5",
+        "reasoning": {"effort": "minimal", "summary": "auto"},
+        "input": [{"role": "user", "content": "ping"}],
+    }
+    minimal_result = normalize_request_body(
+        minimal_reasoning,
+        CompatCfg(reasoning_effort_compat="minimal_to_none"),
+    )
+    check("compat reasoning minimal becomes none",
+          minimal_result.body["reasoning"] == {"effort": "none", "summary": "auto"},
+          str(minimal_result.body))
+    check("compat reasoning original not mutated",
+          minimal_reasoning["reasoning"]["effort"] == "minimal",
+          str(minimal_reasoning))
+    check("compat reasoning records action",
+          ("reasoning.effort", "normalized", "normalized_reasoning_effort_minimal_to_none")
+          in [(a.path, a.action, a.code) for a in minimal_result.actions],
+          str([(a.path, a.action, a.code) for a in minimal_result.actions]))
+
+    keep_reasoning = normalize_request_body(
+        minimal_reasoning,
+        CompatCfg(),
+    )
+    check("compat keeps reasoning minimal by default",
+          keep_reasoning.body is minimal_reasoning and keep_reasoning.actions == (),
+          str(keep_reasoning.actions))
+
+    only_function_call = normalize_request_body(
+        body,
+        CompatCfg(
+            normalize_input_arguments=True,
+            normalize_input_argument_item_types=("function_call",),
+        ),
+    )
+    check("compat item type filter serializes function_call",
+          only_function_call.body["input"][1]["arguments"] == "{\"cmd\":\"pwd\",\"limit\":1}",
+          str(only_function_call.body["input"][1]["arguments"]))
+    check("compat item type filter leaves tool_search_call string",
+          only_function_call.body["input"][2]["arguments"]
+          == "{\"query\":\"computer use screenshot window\",\"limit\":5}",
+          str(only_function_call.body["input"][2]["arguments"]))
 
 
 # --- 3-fix. stateful follow-up repair (#3) ----------------------------------
@@ -1089,6 +1494,7 @@ async def _main():
     await test_truncated_tool_call_discarded()
     await test_commentary_continuation_payload()
     await test_tool_pair_continuation_payload()
+    await test_fold_upstream_response_capture_callback()
     await test_forward_marker_emits_downstream()
     await test_low_reasoning_retry_after_continue()
     test_header_transparency()
@@ -1098,6 +1504,7 @@ async def _main():
     test_reasoning_gate()
     test_model_prefix_gate()
     test_request_audit_store_records_schema()
+    test_request_audit_retention_and_response_modes()
     test_compat_normalizes_input_arguments_safely()
     test_stateful_repair()
     await test_eof_incomplete()

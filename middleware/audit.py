@@ -12,7 +12,7 @@ import json
 import sqlite3
 import threading
 import zlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +111,49 @@ def _tool_name(tool: dict[str, Any]) -> str | None:
     if isinstance(fn, dict) and isinstance(fn.get("name"), str):
         return fn["name"]
     return None
+
+
+class AuditBodyCapture:
+    """Incrementally hash a body while retaining only a bounded prefix."""
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max(0, int(max_bytes))
+        self.original_bytes = 0
+        self.force_store = False
+        self._stored_bytes = 0
+        self._sha = hashlib.sha256()
+        self._chunks: list[bytes] = []
+
+    def add(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self.original_bytes += len(chunk)
+        self._sha.update(chunk)
+        remaining = self.max_bytes - self._stored_bytes
+        if remaining <= 0:
+            return
+        piece = chunk[:remaining]
+        self._chunks.append(piece)
+        self._stored_bytes += len(piece)
+
+    def mark_force_store(self) -> None:
+        self.force_store = True
+
+    @property
+    def stored_body(self) -> bytes:
+        return b"".join(self._chunks)
+
+    @property
+    def stored_bytes(self) -> int:
+        return self._stored_bytes
+
+    @property
+    def body_sha256(self) -> str:
+        return self._sha.hexdigest()
+
+    @property
+    def truncated(self) -> bool:
+        return self.original_bytes > self._stored_bytes
 
 
 class RequestAuditStore:
@@ -224,6 +267,22 @@ class RequestAuditStore:
                     PRIMARY KEY (audit_id, idx)
                 );
 
+                CREATE TABLE IF NOT EXISTS request_audit_bodies (
+                    audit_id INTEGER NOT NULL REFERENCES request_audit(id) ON DELETE CASCADE,
+                    stage TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    content_type TEXT,
+                    body_bytes INTEGER NOT NULL,
+                    body_sha256 TEXT NOT NULL,
+                    body_zlib BLOB,
+                    body_encoding TEXT,
+                    body_truncated INTEGER NOT NULL DEFAULT 0,
+                    body_original_bytes INTEGER NOT NULL,
+                    body_stored_bytes INTEGER NOT NULL,
+                    PRIMARY KEY (audit_id, stage, ordinal)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_request_audit_created
                     ON request_audit(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_request_audit_trace
@@ -236,8 +295,118 @@ class RequestAuditStore:
                     ON request_schema_findings(code);
                 CREATE INDEX IF NOT EXISTS idx_request_compat_actions_code
                     ON request_compat_actions(action, code);
+                CREATE INDEX IF NOT EXISTS idx_request_audit_bodies_stage
+                    ON request_audit_bodies(stage, created_at DESC);
                 """
             )
+
+    def _prune_old_locked(self) -> None:
+        try:
+            days = int(self.cfg.retention_days)
+        except (TypeError, ValueError):
+            days = 0
+        if days <= 0:
+            return
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="milliseconds")
+        self._conn.execute("DELETE FROM request_audit WHERE created_at < ?", (cutoff,))
+
+    def _insert_capture_locked(
+        self,
+        *,
+        audit_id: int,
+        stage: str,
+        ordinal: int,
+        content_type: str | None,
+        capture: AuditBodyCapture,
+    ) -> None:
+        stored = capture.stored_body
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO request_audit_bodies (
+                audit_id, stage, ordinal, created_at, content_type, body_bytes,
+                body_sha256, body_zlib, body_encoding, body_truncated,
+                body_original_bytes, body_stored_bytes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                audit_id,
+                stage,
+                ordinal,
+                _now(),
+                content_type,
+                capture.original_bytes,
+                capture.body_sha256,
+                zlib.compress(stored),
+                "zlib+raw-prefix",
+                int(capture.truncated),
+                capture.original_bytes,
+                capture.stored_bytes,
+            ),
+        )
+
+    def record_body(
+        self,
+        audit_id: int,
+        *,
+        stage: str,
+        body: bytes,
+        content_type: str | None = None,
+        ordinal: int = 0,
+        max_bytes: int | None = None,
+    ) -> None:
+        capture = AuditBodyCapture(self.cfg.max_body_bytes if max_bytes is None else max_bytes)
+        capture.add(body)
+        with self._lock, self._conn:
+            self._insert_capture_locked(
+                audit_id=audit_id,
+                stage=stage,
+                ordinal=ordinal,
+                content_type=content_type,
+                capture=capture,
+            )
+
+    def record_captured_body(
+        self,
+        audit_id: int,
+        *,
+        stage: str,
+        capture: AuditBodyCapture,
+        content_type: str | None = None,
+        ordinal: int = 0,
+    ) -> None:
+        with self._lock, self._conn:
+            self._insert_capture_locked(
+                audit_id=audit_id,
+                stage=stage,
+                ordinal=ordinal,
+                content_type=content_type,
+                capture=capture,
+            )
+
+    def should_record_response_body(self, status_code: int | None, *, force: bool = False) -> bool:
+        mode_value: Any = self.cfg.store_response_body
+        if isinstance(mode_value, bool):
+            mode = "all" if mode_value else "off"
+        else:
+            mode = str(mode_value or "errors").strip().lower()
+        if mode not in {"off", "errors", "all"}:
+            mode = "errors"
+        if mode == "off":
+            return False
+        if mode == "all":
+            return True
+        return force or status_code is None or status_code >= 400
+
+    def should_capture_response_body(
+        self,
+        status_code: int | None,
+        *,
+        force_possible: bool = False,
+    ) -> bool:
+        return self.should_record_response_body(status_code) or (
+            force_possible and self.should_record_response_body(status_code, force=True)
+        )
 
     def record_request(
         self,
@@ -268,6 +437,7 @@ class RequestAuditStore:
         argument_type_counts = self._argument_type_counts(input_rows)
 
         with self._lock, self._conn:
+            self._prune_old_locked()
             cur = self._conn.execute(
                 """
                 INSERT INTO request_audit (
@@ -311,6 +481,16 @@ class RequestAuditStore:
                 ),
             )
             audit_id = int(cur.lastrowid)
+            if self.cfg.store_body:
+                capture = AuditBodyCapture(self.cfg.max_body_bytes)
+                capture.add(raw_body)
+                self._insert_capture_locked(
+                    audit_id=audit_id,
+                    stage="client_request_body",
+                    ordinal=0,
+                    content_type=content_type,
+                    capture=capture,
+                )
             self._conn.executemany(
                 """
                 INSERT INTO request_input_items (
@@ -434,13 +614,6 @@ class RequestAuditStore:
             if "arguments" in item:
                 arg_path = f"{path}.arguments"
                 if isinstance(args, str):
-                    level = "warn" if item.get("type") == "function_call" else "info"
-                    findings.append((
-                        level,
-                        arg_path,
-                        "arguments_string",
-                        f"arguments is a JSON string; parsed_json_type={args_json_type}",
-                    ))
                     if args_json_type == "invalid_json":
                         findings.append((
                             "warn",
@@ -455,13 +628,34 @@ class RequestAuditStore:
                             "arguments_json_not_object",
                             f"arguments string parses as {args_json_type}, not object",
                         ))
-                elif item.get("type") == "function_call" and not isinstance(args, dict):
+                    else:
+                        findings.append((
+                            "info",
+                            arg_path,
+                            "arguments_string",
+                            "arguments is a JSON string; parsed_json_type=object",
+                        ))
+                elif item.get("type") == "function_call" and isinstance(args, dict):
                     findings.append((
                         "warn",
                         arg_path,
-                        "arguments_not_object",
-                        f"function_call arguments is {args_type}, not object",
+                        "arguments_object",
+                        "function_call arguments is object; OpenAI-compatible Responses history expects a JSON string",
                     ))
+                elif item.get("type") == "function_call":
+                    findings.append((
+                        "warn",
+                        arg_path,
+                        "arguments_not_string",
+                        f"function_call arguments is {args_type}, not string",
+                    ))
+            if item.get("type") == "web_search_call" and not str(item.get("id") or "").strip():
+                findings.append((
+                    "warn",
+                    f"{path}.id",
+                    "web_search_call_missing_id",
+                    "web_search_call item is missing required id; some Responses upstreams reject it",
+                ))
         return rows, findings
 
     def _tool_rows(self, tools: Any) -> list[tuple[Any, ...]]:

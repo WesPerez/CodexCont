@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import uuid
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -19,7 +20,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from .audit import RequestAuditStore
+from .audit import AuditBodyCapture, RequestAuditStore
 from .codex import (
     build_round_payload,
     declares_continue_tool,
@@ -110,7 +111,16 @@ async def _passthrough(
 
     async def body_iter():
         try:
-            async for chunk in resp.aiter_bytes():
+            async for chunk in _capture_response_stream(
+                request,
+                audit_id,
+                resp.aiter_bytes(),
+                stages=("upstream_response_body", "downstream_response_body"),
+                ordinal=1,
+                status_code=resp.status_code,
+                content_type=resp.headers.get("content-type"),
+                force_possible=True,
+            ):
                 yield chunk
         finally:
             await resp.aclose()
@@ -120,6 +130,10 @@ async def _passthrough(
         status_code=resp.status_code,
         media_type=resp.headers.get("content-type", "text/event-stream"),
     )
+
+
+def _audit_store(request: Request) -> RequestAuditStore | None:
+    return getattr(request.app.state, "request_audit", None)
 
 
 async def _audit_request(
@@ -133,7 +147,7 @@ async def _audit_request(
     upstream_url: str | None,
     decision: str,
 ) -> int | None:
-    store: RequestAuditStore | None = getattr(request.app.state, "request_audit", None)
+    store = _audit_store(request)
     if store is None:
         return None
     try:
@@ -168,7 +182,7 @@ async def _audit_response(
 ) -> None:
     if audit_id is None:
         return
-    store: RequestAuditStore | None = getattr(request.app.state, "request_audit", None)
+    store = _audit_store(request)
     if store is None:
         return
     try:
@@ -190,13 +204,185 @@ async def _audit_compat_actions(
 ) -> None:
     if audit_id is None or not actions:
         return
-    store: RequestAuditStore | None = getattr(request.app.state, "request_audit", None)
+    store = _audit_store(request)
     if store is None:
         return
     try:
         await asyncio.to_thread(store.record_compat_actions, audit_id, actions)
     except Exception:
         log.exception("request compat audit failed id=%s", audit_id)
+
+
+async def _audit_body(
+    request: Request,
+    audit_id: int | None,
+    *,
+    stage: str,
+    body: bytes,
+    content_type: str | None = None,
+    ordinal: int = 0,
+    max_bytes: int | None = None,
+) -> None:
+    if audit_id is None:
+        return
+    store = _audit_store(request)
+    if store is None:
+        return
+    try:
+        await asyncio.to_thread(
+            store.record_body,
+            audit_id,
+            stage=stage,
+            body=body,
+            content_type=content_type,
+            ordinal=ordinal,
+            max_bytes=max_bytes,
+        )
+    except Exception:
+        log.exception("request body audit failed id=%s stage=%s", audit_id, stage)
+
+
+async def _audit_forwarded_body(
+    request: Request,
+    audit_id: int | None,
+    body: bytes,
+    *,
+    ordinal: int,
+) -> None:
+    cfg: Config = request.app.state.cfg
+    if not cfg.request_log.store_forwarded_body:
+        return
+    await _audit_body(
+        request,
+        audit_id,
+        stage="upstream_request_body",
+        body=body,
+        content_type=request.headers.get("content-type") or "application/json",
+        ordinal=ordinal,
+        max_bytes=cfg.request_log.max_body_bytes,
+    )
+
+
+def _should_capture_response(
+    request: Request,
+    status_code: int | None,
+    *,
+    force: bool = False,
+    force_possible: bool = False,
+) -> bool:
+    store = _audit_store(request)
+    return bool(
+        store
+        and store.should_capture_response_body(status_code, force_possible=force_possible)
+    ) or bool(store and force and store.should_record_response_body(status_code, force=True))
+
+
+def _response_chunk_has_error_event(chunk: bytes) -> bool:
+    return b"response.incomplete" in chunk or b"response.failed" in chunk
+
+
+async def _audit_capture(
+    request: Request,
+    audit_id: int | None,
+    *,
+    stage: str,
+    capture: AuditBodyCapture,
+    content_type: str | None = None,
+    ordinal: int = 0,
+) -> None:
+    if audit_id is None:
+        return
+    store = _audit_store(request)
+    if store is None:
+        return
+    try:
+        await asyncio.to_thread(
+            store.record_captured_body,
+            audit_id,
+            stage=stage,
+            capture=capture,
+            content_type=content_type,
+            ordinal=ordinal,
+        )
+    except Exception:
+        log.exception("captured body audit failed id=%s stage=%s", audit_id, stage)
+
+
+async def _audit_response_body(
+    request: Request,
+    audit_id: int | None,
+    *,
+    stage: str,
+    body: bytes,
+    status_code: int | None,
+    content_type: str | None = None,
+    ordinal: int = 0,
+    force: bool = False,
+) -> None:
+    if not _should_capture_response(request, status_code, force=force):
+        return
+    cfg: Config = request.app.state.cfg
+    await _audit_body(
+        request,
+        audit_id,
+        stage=stage,
+        body=body,
+        content_type=content_type,
+        ordinal=ordinal,
+        max_bytes=cfg.request_log.max_response_body_bytes,
+    )
+
+
+async def _capture_response_stream(
+    request: Request,
+    audit_id: int | None,
+    source: AsyncIterator[bytes],
+    *,
+    stages: tuple[str, ...],
+    ordinal: int,
+    status_code: int | None,
+    content_type: str | None,
+    force: bool = False,
+    force_possible: bool = False,
+) -> AsyncIterator[bytes]:
+    cfg: Config = request.app.state.cfg
+    capture = (
+        AuditBodyCapture(cfg.request_log.max_response_body_bytes)
+        if _should_capture_response(
+            request,
+            status_code,
+            force=force,
+            force_possible=force_possible,
+        )
+        else None
+    )
+    try:
+        async for chunk in source:
+            if capture is not None:
+                capture.add(chunk)
+                if _response_chunk_has_error_event(chunk):
+                    capture.mark_force_store()
+            yield chunk
+    finally:
+        store = _audit_store(request)
+        should_store = bool(
+            capture is not None
+            and store is not None
+            and store.should_record_response_body(
+                status_code,
+                force=force or capture.force_store,
+            )
+        )
+        if should_store and capture is not None:
+            for stage in stages:
+                await _audit_capture(
+                    request,
+                    audit_id,
+                    stage=stage,
+                    capture=capture,
+                    content_type=content_type,
+                    ordinal=ordinal,
+                )
 
 
 def _log_compat_result(
@@ -354,6 +540,7 @@ async def handle_responses(request: Request) -> Response:
         _log_compat_result(compat, trace_id=trace_id, request_id=request_id, phase="passthrough")
         await _audit_compat_actions(request, audit_id, compat.actions)
         forward_raw = _body_bytes(compat.body) if compat.changed_count else raw
+        await _audit_forwarded_body(request, audit_id, forward_raw, ordinal=1)
         log.info("passthrough (%s): model=%s path=%s url=%s",
                  why, body.get("model"), request.url.path, url)
         return await _passthrough(client, cfg, request, forward_raw, url, audit_id=audit_id)
@@ -405,6 +592,59 @@ async def handle_responses(request: Request) -> Response:
         phase="fold-round-1",
     )
     payload = payload_compat.body
+    payload_raw = _body_bytes(payload)
+    await _audit_forwarded_body(request, audit_id, payload_raw, ordinal=1)
+
+    async def audit_continuation_request(round_no: int, body_bytes: bytes) -> None:
+        await _audit_forwarded_body(request, audit_id, body_bytes, ordinal=round_no)
+
+    def make_upstream_response_capture(
+        round_no: int,
+        status_code: int | None,
+        content_type: str | None,
+    ) -> AuditBodyCapture | None:
+        if not _should_capture_response(request, status_code, force_possible=True):
+            return None
+        return AuditBodyCapture(cfg.request_log.max_response_body_bytes)
+
+    async def audit_upstream_response_capture(
+        round_no: int,
+        status_code: int | None,
+        content_type: str | None,
+        capture: AuditBodyCapture,
+    ) -> None:
+        store = _audit_store(request)
+        if store is None or not store.should_record_response_body(
+            status_code,
+            force=capture.force_store,
+        ):
+            return
+        await _audit_capture(
+            request,
+            audit_id,
+            stage="upstream_response_body",
+            capture=capture,
+            content_type=content_type,
+            ordinal=round_no,
+        )
+
+    async def audit_upstream_response_bytes(
+        round_no: int,
+        status_code: int | None,
+        content_type: str | None,
+        body_bytes: bytes,
+        force: bool = False,
+    ) -> None:
+        await _audit_response_body(
+            request,
+            audit_id,
+            stage="upstream_response_body",
+            body=body_bytes,
+            status_code=status_code,
+            content_type=content_type,
+            ordinal=round_no,
+            force=force,
+        )
 
     # Open round 1 here so a non-2xx (e.g. bad auth) is mirrored with its real
     # status code rather than buried inside a 200 SSE stream.
@@ -417,22 +657,54 @@ async def handle_responses(request: Request) -> Response:
     )
     if resp.status_code >= 400:
         err = await resp.aread()
+        content_type = resp.headers.get("content-type")
+        await _audit_response_body(
+            request,
+            audit_id,
+            stage="upstream_response_body",
+            body=err,
+            status_code=resp.status_code,
+            content_type=content_type,
+            ordinal=1,
+        )
+        await _audit_response_body(
+            request,
+            audit_id,
+            stage="downstream_response_body",
+            body=err,
+            status_code=resp.status_code,
+            content_type=content_type,
+            ordinal=1,
+        )
         await resp.aclose()
         return Response(
             err, status_code=resp.status_code, media_type=resp.headers.get("content-type")
         )
 
     return StreamingResponse(
-        fold_stream(
-            client,
-            cfg,
-            body,
-            headers,
-            resp,
-            request.app.state.id_store,
-            url=url,
-            trace_id=trace_id,
-            request_id=request_id,
+        _capture_response_stream(
+            request,
+            audit_id,
+            fold_stream(
+                client,
+                cfg,
+                body,
+                headers,
+                resp,
+                request.app.state.id_store,
+                url=url,
+                trace_id=trace_id,
+                request_id=request_id,
+                audit_upstream_request_body=audit_continuation_request,
+                make_upstream_response_capture=make_upstream_response_capture,
+                audit_upstream_response_capture=audit_upstream_response_capture,
+                audit_upstream_response_bytes=audit_upstream_response_bytes,
+            ),
+            stages=("downstream_response_body",),
+            ordinal=1,
+            status_code=200,
+            content_type="text/event-stream",
+            force_possible=True,
         ),
         media_type="text/event-stream",
     )

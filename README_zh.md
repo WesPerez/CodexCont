@@ -154,21 +154,41 @@ enabled = true
 path = "logs/request_audit.sqlite3"
 store_body = true
 max_body_bytes = 8388608
+retention_days = 7
+store_forwarded_body = true
+store_response_body = "errors"
+max_response_body_bytes = 1048576
 preview_chars = 240
 ```
 
 审计库会写入请求级元数据、压缩后的原始 body、逐项拆解的 `input[i]`、`tools[i]`，以及 schema findings。它不会保存 `Authorization` / `Cookie` 等请求头。`request_input_items` 表能直接看到每个历史项的 `type`、`name`、`arguments_type`、`arguments_json_type`，例如定位 `input[83].arguments` 是 `string` 还是 `object`。
 
+`request_audit_bodies` 会按阶段保存有上限的压缩正文：`client_request_body`、
+`upstream_request_body`、`upstream_response_body`、`downstream_response_body`。
+默认保存实际转发给上游的请求正文；响应正文默认只保存错误响应。临时需要排查成功流式
+SSE 时，把 `store_response_body` 改成 `"all"`。每次写入新审计记录时，会按
+`retention_days` 清理这个审计库里的旧主记录，子表通过 SQLite 外键级联删除。
+
 ## 兼容性归一化
 
-有些 Responses 兼容上游要求历史 call item 的 `arguments` 是 JSON object，但 Codex 客户端可能会把它们回放成 JSON 字符串。可以只针对这类上游打开兼容转换：
+不同 Responses 兼容历史工具项对 `arguments` 的形态要求不完全一样。如果历史回放里混入旧客户端或特定上游的形态，可以打开兼容转换：
 
 ```toml
 [compat]
 normalize_input_arguments = true
+synthesize_web_search_call_ids = true
+max_output_tokens_compat = "keep"
+reasoning_effort_compat = "keep"
 ```
 
-开启后，仅转换 call-like `input[i]` 中 `arguments` 为字符串、且能严格解析为 JSON object 的字段。非法 JSON、非 object JSON、重复 key 对象、已经是 object 的值，以及无关字段都会保持原样。原始请求 bytes 仍保存在审计库，转换/跳过决策会写入 `request_compat_actions`。
+开启后，仅归一化配置内的 `input[i]` 类型。默认会把 object 形态的 `function_call.arguments` 序列化成 JSON 字符串，这是 OpenAI Responses 工具调用历史的常规形态；同时会把 JSON 字符串形态的 `tool_search_call.arguments` 严格解析成 object，用于要求该内置工具历史形态的上游。开启 `synthesize_web_search_call_ids` 后，缺失的 `web_search_call.id` 会补成稳定的 `ws_...` id，因为 Responses 历史回放需要 item id。非法 JSON、非 object JSON、重复 key 对象、已经正确的值，以及无关字段都会保持原样。原始请求 bytes 仍保存在审计库，转换/跳过决策会写入 `request_compat_actions`。
+
+`max_output_tokens` 是标准 Responses 字段。标准 Responses 上游应保持
+`keep`。只有某个上游明确在 Responses 入口接受 Chat Completions 风格的
+`max_tokens`，才使用 `max_output_tokens_compat = "rename_to_max_tokens"`。
+如果上游两个字段都拒绝，只能使用 `"drop"`；它会同时移除 `max_output_tokens`
+和旧式 `max_tokens`，这能恢复兼容，但会在转发前移除用户请求的输出上限。只有上游拒绝 `reasoning.effort = "minimal"`、但接受
+`"none"` 时，才启用 `reasoning_effort_compat = "minimal_to_none"`。
 
 ## 响应 metadata
 

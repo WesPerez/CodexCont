@@ -12,11 +12,13 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 
 import httpx
 
+from .audit import AuditBodyCapture
 from .codex import (
     build_round_payload,
     commentary_message,
@@ -34,6 +36,11 @@ log = logging.getLogger("middleware.proxy")
 
 _TERMINAL = ("response.completed", "response.failed", "response.incomplete")
 _USAGE_TOP = ("input_tokens", "output_tokens", "total_tokens")
+
+UpstreamRequestAudit = Callable[[int, bytes], Awaitable[None]]
+UpstreamCaptureFactory = Callable[[int, int | None, str | None], AuditBodyCapture | None]
+UpstreamCaptureAudit = Callable[[int, int | None, str | None, AuditBodyCapture], Awaitable[None]]
+UpstreamBytesAudit = Callable[[int, int | None, str | None, bytes, bool], Awaitable[None]]
 
 
 async def open_round(
@@ -72,6 +79,21 @@ async def _tee(aiter: AsyncIterator[bytes], dump_path: Path) -> AsyncIterator[by
             yield chunk
     finally:
         f.close()
+
+
+async def _capture_bytes(
+    aiter: AsyncIterator[bytes],
+    capture: AuditBodyCapture,
+    on_done: Callable[[], Awaitable[None]],
+) -> AsyncIterator[bytes]:
+    try:
+        async for chunk in aiter:
+            capture.add(chunk)
+            if b"response.incomplete" in chunk or b"response.failed" in chunk:
+                capture.mark_force_store()
+            yield chunk
+    finally:
+        await on_done()
 
 
 def _sum_usage(acc: dict[str, Any], usage: dict[str, Any] | None) -> None:
@@ -344,6 +366,10 @@ async def fold_stream(
     url: str | None = None,
     trace_id: str = "",
     request_id: str = "",
+    audit_upstream_request_body: UpstreamRequestAudit | None = None,
+    make_upstream_response_capture: UpstreamCaptureFactory | None = None,
+    audit_upstream_response_capture: UpstreamCaptureAudit | None = None,
+    audit_upstream_response_bytes: UpstreamBytesAudit | None = None,
 ) -> AsyncIterator[bytes]:
     """Yield the folded downstream SSE byte stream. `first_response` is the
     already-opened (2xx) round-1 upstream response; later rounds are opened here
@@ -385,7 +411,36 @@ async def fold_stream(
             terminal: dict[str, Any] | None = None
             usage: dict[str, Any] | None = None
 
+            response_capture = (
+                make_upstream_response_capture(
+                    round_no,
+                    response.status_code,
+                    response.headers.get("content-type"),
+                )
+                if make_upstream_response_capture is not None
+                else None
+            )
+            response_capture_saved = False
+
+            async def save_response_capture() -> None:
+                nonlocal response_capture_saved
+                if (
+                    response_capture is None
+                    or response_capture_saved
+                    or audit_upstream_response_capture is None
+                ):
+                    return
+                response_capture_saved = True
+                await audit_upstream_response_capture(
+                    round_no,
+                    response.status_code,
+                    response.headers.get("content-type"),
+                    response_capture,
+                )
+
             byte_src = response.aiter_bytes()
+            if response_capture is not None:
+                byte_src = _capture_bytes(byte_src, response_capture, save_response_capture)
             if cfg.log.dump_rounds_dir:
                 dump_dir = Path(cfg.log.dump_rounds_dir)
                 dump_dir.mkdir(parents=True, exist_ok=True)
@@ -431,6 +486,7 @@ async def fold_stream(
                         "elapsed_seconds": round(round_elapsed, 3),
                     })
                     await response.aclose()
+                    await save_response_capture()
                     timeout_label = (
                         f"round timeout after {upstream_round_timeout:.3g}s"
                         if timeout_reason == "upstream_round_timeout"
@@ -584,6 +640,7 @@ async def fold_stream(
                      decision, round_elapsed)
 
             await response.aclose()
+            await save_response_capture()
 
             if do_continue:
                 continued_before = True
@@ -627,12 +684,25 @@ async def fold_stream(
                 payload = _normalize_payload_for_upstream(
                     cfg, payload, trace=trace, req=req, round_no=round_no + 1
                 )
+                if audit_upstream_request_body is not None:
+                    await audit_upstream_request_body(
+                        round_no + 1,
+                        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                    )
                 response = await open_round(client, url, payload, headers)
                 if response.status_code >= 400:
-                    body = (await response.aread())[:2000]
+                    body = await response.aread()
+                    if audit_upstream_response_bytes is not None:
+                        await audit_upstream_response_bytes(
+                            round_no + 1,
+                            response.status_code,
+                            response.headers.get("content-type"),
+                            body,
+                            True,
+                        )
                     await response.aclose()
                     log.warning("continuation trace=%s req=%s round %d failed: %s %s",
-                                trace, req, round_no + 1, response.status_code, body)
+                                trace, req, round_no + 1, response.status_code, body[:2000])
                     log.info(
                         "done trace=%s req=%s: %d round(s) | %s | status=incomplete "
                         "stop=upstream_error elapsed=%.1fs",

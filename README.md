@@ -156,27 +156,57 @@ enabled = true
 path = "logs/request_audit.sqlite3"
 store_body = true
 max_body_bytes = 8388608
+retention_days = 7
+store_forwarded_body = true
+store_response_body = "errors"
+max_response_body_bytes = 1048576
 preview_chars = 240
 ```
 
 The audit database stores request metadata, a compressed raw body, per-item `input[i]` rows, per-tool rows, and schema findings. It does not store `Authorization` / `Cookie` headers. The `request_input_items` table makes fields such as `input[83].arguments` directly queryable by `type`, `name`, `arguments_type`, and `arguments_json_type`.
 
+`request_audit_bodies` stores bounded compressed body artifacts by stage:
+`client_request_body`, `upstream_request_body`, `upstream_response_body`, and
+`downstream_response_body`. By default, forwarded upstream request bodies are
+stored, while response bodies are stored only for errors. Set
+`store_response_body = "all"` temporarily when you need successful streaming SSE
+prefixes as well. Rows older than `retention_days` are pruned from this audit DB
+on new writes; child rows are removed by SQLite foreign-key cascade.
+
 ## Compatibility normalization
 
-Some Responses-compatible upstreams require historical call item `arguments` to
-be JSON objects, while Codex clients may replay them as JSON strings. Enable the
-compatibility transform for those upstreams:
+Different Responses-compatible historical tool items require different
+`arguments` shapes. Enable the compatibility transform when replayed history
+contains older or upstream-specific shapes:
 
 ```toml
 [compat]
 normalize_input_arguments = true
+synthesize_web_search_call_ids = true
+max_output_tokens_compat = "keep"
+reasoning_effort_compat = "keep"
 ```
 
-When enabled, only call-like `input[i]` items whose `arguments` is a string that
-strictly parses to a JSON object are converted before forwarding. Invalid JSON,
-non-object JSON, duplicate-key objects, already-object values, and unrelated
-fields are left unchanged. The original request bytes remain in the audit DB,
-and conversion/skip decisions are written to `request_compat_actions`.
+When enabled, only configured `input[i]` item types are normalized. By default,
+`function_call.arguments` objects are serialized to JSON strings, which is the
+normal OpenAI Responses shape, while `tool_search_call.arguments` JSON strings
+are strictly parsed to objects for upstreams that require that built-in-tool
+history shape. Enable `synthesize_web_search_call_ids` to add stable `ws_...`
+ids to historical `web_search_call` items missing `id`, because Responses
+history replay requires an item id. Invalid JSON, non-object JSON, duplicate-key
+objects, already-correct values, and unrelated fields are left unchanged. The
+original request bytes remain in the audit DB, and conversion/skip decisions are
+written to `request_compat_actions`.
+
+`max_output_tokens` is the standard Responses field. Keep it for standard
+Responses upstreams. Use `max_output_tokens_compat = "rename_to_max_tokens"`
+only for an upstream that explicitly accepts the Chat Completions-style
+`max_tokens` field on its Responses endpoint. Use `"drop"` for upstreams that
+reject both field names; this removes `max_output_tokens` and any legacy
+`max_tokens`, restoring compatibility but removing the requested output cap
+before forwarding. Use `reasoning_effort_compat = "minimal_to_none"`
+only for upstreams that reject `reasoning.effort = "minimal"` but accept
+`"none"`.
 
 ## Response metadata
 
