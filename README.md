@@ -134,6 +134,50 @@ For each upstream round:
 
 The downstream agent sees one response, while metadata includes details about the hidden rounds.
 
+## Stream timeout
+
+Set `[stream].upstream_event_timeout_seconds` to cap how long one upstream round may go without a parsed SSE `data:` event. Set `[stream].upstream_round_timeout_seconds` to cap total wall-clock time for one round, even if parseable SSE events keep arriving:
+
+```toml
+[stream]
+upstream_event_timeout_seconds = 300
+upstream_round_timeout_seconds = 480
+```
+
+SSE comments/keepalives do not count as progress. On timeout, the middleware emits `response.incomplete` with `incomplete_details.reason = "upstream_event_timeout"` or `"upstream_round_timeout"` and does not flush unconfirmed tentative message/tool output.
+
+## Request audit log
+
+Enable the independent SQLite request audit database when diagnosing upstream `400` or schema compatibility issues:
+
+```toml
+[request_log]
+enabled = true
+path = "logs/request_audit.sqlite3"
+store_body = true
+max_body_bytes = 8388608
+preview_chars = 240
+```
+
+The audit database stores request metadata, a compressed raw body, per-item `input[i]` rows, per-tool rows, and schema findings. It does not store `Authorization` / `Cookie` headers. The `request_input_items` table makes fields such as `input[83].arguments` directly queryable by `type`, `name`, `arguments_type`, and `arguments_json_type`.
+
+## Compatibility normalization
+
+Some Responses-compatible upstreams require historical call item `arguments` to
+be JSON objects, while Codex clients may replay them as JSON strings. Enable the
+compatibility transform for those upstreams:
+
+```toml
+[compat]
+normalize_input_arguments = true
+```
+
+When enabled, only call-like `input[i]` items whose `arguments` is a string that
+strictly parses to a JSON object are converted before forwarding. Invalid JSON,
+non-object JSON, duplicate-key objects, already-object values, and unrelated
+fields are left unchanged. The original request bytes remain in the audit DB,
+and conversion/skip decisions are written to `request_compat_actions`.
+
 ## Response metadata
 
 The final reconstructed response includes proxy metadata such as:
@@ -163,13 +207,16 @@ Current offline coverage includes:
 - header transparency
 - upstream URL resolution
 - auth safety guard
-- EOF/upstream-error behavior
+- EOF/upstream-error/failed-terminal/stream-timeout behavior
+- structured request audit logging to SQLite
+- compatibility normalization of `input[i].arguments`
 
 ## Project layout
 
 ```text
 middleware/
   app.py       # Starlette app and route handler
+  audit.py     # independent SQLite request audit logging
   codex.py     # truncation math and continuation payload builders
   config.py    # config.toml loader and dataclasses
   creds.py     # upstream header/auth construction

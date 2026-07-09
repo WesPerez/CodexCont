@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import sys
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 
@@ -24,6 +26,7 @@ from middleware.app import (
     _resolve_upstream_url,
     _url_is_from_header,
 )
+from middleware.audit import RequestAuditStore
 from middleware.codex import (
     continue_call_id,
     is_truncation_pattern,
@@ -32,7 +35,8 @@ from middleware.codex import (
     should_continue,
     tier_n,
 )
-from middleware.config import load_config
+from middleware.compat import normalize_request_body
+from middleware.config import CompatCfg, RequestLogCfg, load_config
 from middleware.creds import build_upstream_headers, would_inject_authorization
 from middleware.proxy import fold_stream
 from middleware.sse import DONE, incremental_sse
@@ -77,6 +81,33 @@ class FakeResp:
 
     async def aclose(self) -> None:
         pass
+
+
+class SlowKeepaliveResp(FakeResp):
+    def __init__(self, data: bytes, delay: float = 0.01):
+        super().__init__(data)
+        self._delay = delay
+
+    async def aiter_bytes(self):
+        if self._data:
+            yield self._data
+        while True:
+            await asyncio.sleep(self._delay)
+            yield b": keepalive\n\n"
+
+
+class SlowEventsResp(FakeResp):
+    def __init__(self, data: bytes, event: dict, delay: float = 0.01):
+        super().__init__(data)
+        self._event = event
+        self._delay = delay
+
+    async def aiter_bytes(self):
+        if self._data:
+            yield self._data
+        while True:
+            await asyncio.sleep(self._delay)
+            yield make_sse([self._event])
 
 
 class FakeClient:
@@ -616,6 +647,198 @@ def test_model_prefix_gate():
     check("model gate gpt rejects missing model", not _model_allowed_to_fold(gpt_only, None))
 
 
+# --- request audit logging --------------------------------------------------
+
+
+def test_request_audit_store_records_schema():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = RequestLogCfg(
+            enabled=True,
+            path="audit.sqlite3",
+            store_body=True,
+            max_body_bytes=4096,
+            preview_chars=80,
+        )
+        store = RequestAuditStore(cfg, Path(tmp))
+        body = {
+            "model": "gpt-5.5",
+            "stream": True,
+            "max_output_tokens": 100,
+            "input": [
+                {"type": "message", "role": "user", "content": "q"},
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_1",
+                    "arguments": "{\"cmd\":\"ls\"}",
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+            ],
+            "tools": [{"type": "function", "name": "exec_command"}],
+        }
+        raw = json.dumps(body).encode()
+        audit_id = store.record_request(
+            trace_id="trace_a",
+            request_id="req_a",
+            method="POST",
+            path="/v1/responses",
+            client_host="127.0.0.1",
+            user_agent="test",
+            content_type="application/json",
+            upstream_url="http://upstream/v1/responses",
+            decision="fold",
+            raw_body=raw,
+            body=body,
+            parse_error=None,
+        )
+        store.update_response(audit_id, upstream_status_code=502, downstream_status_code=502)
+        compat = normalize_request_body(body, CompatCfg(normalize_input_arguments=True))
+        store.record_compat_actions(audit_id, compat.actions)
+        store.close()
+
+        conn = sqlite3.connect(Path(tmp) / "audit.sqlite3")
+        conn.row_factory = sqlite3.Row
+        req = conn.execute(
+            "select * from request_audit where id = ?", (audit_id,)
+        ).fetchone()
+        check("audit request row inserted", req is not None)
+        check("audit input_count", req["input_count"] == 3, str(req["input_count"]))
+        check("audit body stored compressed", req["raw_body_zlib"] is not None)
+        check("audit upstream status recorded", req["upstream_status_code"] == 502)
+
+        item = conn.execute(
+            """
+            select idx, item_type, name, arguments_type, arguments_json_type
+            from request_input_items
+            where audit_id = ? and idx = 1
+            """,
+            (audit_id,),
+        ).fetchone()
+        check("audit function_call item row", item["item_type"] == "function_call")
+        check("audit arguments type string", item["arguments_type"] == "string",
+              str(item["arguments_type"]))
+        check("audit arguments parses object", item["arguments_json_type"] == "object",
+              str(item["arguments_json_type"]))
+
+        findings = conn.execute(
+            """
+            select path, code from request_schema_findings
+            where audit_id = ?
+            order by idx
+            """,
+            (audit_id,),
+        ).fetchall()
+        pairs = {(row["path"], row["code"]) for row in findings}
+        check("audit flags input arguments string",
+              ("input[1].arguments", "arguments_string") in pairs, str(pairs))
+        check("audit flags max_output_tokens",
+              ("max_output_tokens", "top_level_max_output_tokens") in pairs, str(pairs))
+
+        compat_rows = conn.execute(
+            """
+            select path, action, code, original_type, parsed_type
+            from request_compat_actions
+            where audit_id = ?
+            order by idx
+            """,
+            (audit_id,),
+        ).fetchall()
+        check("audit records compat action", len(compat_rows) == 1, str(compat_rows))
+        if compat_rows:
+            row = compat_rows[0]
+            check("audit compat path",
+                  row["path"] == "input[1].arguments", str(dict(row)))
+            check("audit compat normalized object",
+                  row["action"] == "normalized" and row["parsed_type"] == "object",
+                  str(dict(row)))
+        conn.close()
+
+
+def test_compat_normalizes_input_arguments_safely():
+    body = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"ls\",\"limit\":5}",
+                "extra": {"keep": True},
+            },
+            {
+                "type": "tool_search_call",
+                "arguments": "{\"query\":\"computer use screenshot window\",\"limit\":5}",
+            },
+            {"type": "function_call", "arguments": "{\"a\":1,\"a\":2}"},
+            {"type": "function_call", "arguments": "[1,2]"},
+            {"type": "function_call", "arguments": "{\"unterminated\""},
+            {"type": "message", "arguments": "{\"do_not\":\"touch\"}"},
+            {
+                "type": "function_call_output",
+                "output": "{\"do_not\":\"touch\"}",
+                "arguments": "{\"also\":\"touch?\"}",
+            },
+            {"type": "function_call", "arguments": {"already": "object"}},
+            {"type": "function_call", "arguments": 7},
+            {"type": "function_call", "arguments": "{\"ratio\":1.234567890123456789}"},
+        ],
+    }
+
+    result = normalize_request_body(body, CompatCfg(normalize_input_arguments=True))
+    out = result.body
+
+    check("compat returns new body when changed", out is not body)
+    check("compat original not mutated",
+          isinstance(body["input"][0]["arguments"], str), str(body["input"][0]))
+    check("compat function_call args object",
+          out["input"][0]["arguments"] == {"cmd": "ls", "limit": 5},
+          str(out["input"][0]["arguments"]))
+    check("compat tool_search_call args object",
+          out["input"][1]["arguments"] == {
+              "query": "computer use screenshot window",
+              "limit": 5,
+          },
+          str(out["input"][1]["arguments"]))
+    check("compat preserves sibling fields",
+          out["input"][0]["extra"] == {"keep": True}, str(out["input"][0]))
+    check("compat duplicate keys skipped",
+          out["input"][2]["arguments"] == "{\"a\":1,\"a\":2}",
+          str(out["input"][2]["arguments"]))
+    check("compat non-object JSON skipped",
+          out["input"][3]["arguments"] == "[1,2]", str(out["input"][3]["arguments"]))
+    check("compat invalid JSON skipped",
+          out["input"][4]["arguments"] == "{\"unterminated\"",
+          str(out["input"][4]["arguments"]))
+    check("compat message arguments untouched",
+          out["input"][5]["arguments"] == "{\"do_not\":\"touch\"}",
+          str(out["input"][5]["arguments"]))
+    check("compat output item arguments untouched",
+          out["input"][6]["arguments"] == "{\"also\":\"touch?\"}",
+          str(out["input"][6]["arguments"]))
+    check("compat existing object reused",
+          out["input"][7]["arguments"] == {"already": "object"},
+          str(out["input"][7]["arguments"]))
+    codes = [(a.path, a.action, a.code) for a in result.actions]
+    check("compat action counts",
+          result.changed_count == 2 and result.skipped_count == 5, str(codes))
+    check("compat action duplicate",
+          ("input[2].arguments", "skipped", "duplicate_keys") in codes, str(codes))
+    check("compat action non-object",
+          ("input[3].arguments", "skipped", "non_object_json") in codes, str(codes))
+    check("compat action invalid",
+          ("input[4].arguments", "skipped", "invalid_json") in codes, str(codes))
+    check("compat action unsupported type",
+          ("input[8].arguments", "skipped", "unsupported_argument_type") in codes,
+          str(codes))
+    check("compat floating point skipped",
+          out["input"][9]["arguments"] == "{\"ratio\":1.234567890123456789}"
+          and ("input[9].arguments", "skipped", "floating_point_number") in codes,
+          str(codes))
+
+    disabled = normalize_request_body(body, CompatCfg(normalize_input_arguments=False))
+    check("compat disabled returns original body", disabled.body is body)
+    check("compat disabled no actions", disabled.actions == ())
+
+
 # --- 3-fix. stateful follow-up repair (#3) ----------------------------------
 
 
@@ -691,6 +914,171 @@ async def test_eof_incomplete():
           str([it.get("type") for it in out_items]))
 
 
+async def test_upstream_event_timeout_incomplete():
+    base = load_config(ROOT / "config.toml")
+    cfg = replace(
+        base,
+        stream=replace(base.stream, upstream_event_timeout_seconds=0.03),
+    )
+    base_body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "q"}]}
+    events = [
+        {"type": "response.created", "response": {"id": "resp_t", "status": "in_progress"}},
+        {"type": "response.in_progress", "response": {"id": "resp_t"}},
+        {"type": "response.output_item.added", "output_index": 0,
+         "item": {"id": "rs_t", "type": "reasoning"}},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {"id": "rs_t", "type": "reasoning", "encrypted_content": "E"}},
+        {"type": "response.output_item.added", "output_index": 1,
+         "item": {"id": "msg_t", "type": "message"}},
+        {"type": "response.output_text.delta", "output_index": 1, "item_id": "msg_t",
+         "content_index": 0, "delta": "partial"},
+    ]
+
+    evs = [e for e in await run_fold(
+        cfg,
+        base_body,
+        SlowKeepaliveResp(make_sse(events), delay=0.005),
+        [],
+    ) if isinstance(e, dict)]
+    term = evs[-1]
+    check("event timeout terminal is incomplete",
+          term.get("type") == "response.incomplete", term.get("type"))
+    reason = ((term.get("response") or {}).get("incomplete_details") or {}).get("reason")
+    check("event timeout reason upstream_event_timeout",
+          reason == "upstream_event_timeout", str(reason))
+    leaked = any(e.get("type") == "response.output_text.delta" for e in evs)
+    check("event timeout does not leak buffered message", not leaked)
+    md = (term.get("response") or {}).get("metadata") or {}
+    decisions = [r.get("decision") for r in (md.get("proxy_rounds") or [])]
+    check("event timeout decision recorded",
+          decisions == ["upstream_event_timeout"], str(decisions))
+
+
+async def test_failed_terminal_incomplete_no_buffer_flush():
+    cfg = load_config(ROOT / "config.toml")
+    base_body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "q"}]}
+    events = [
+        {"type": "response.created", "response": {"id": "resp_f", "status": "in_progress"}},
+        {"type": "response.in_progress", "response": {"id": "resp_f"}},
+        {"type": "response.output_item.added", "output_index": 0,
+         "item": {"id": "rs_f", "type": "reasoning"}},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {"id": "rs_f", "type": "reasoning", "encrypted_content": "E"}},
+        {"type": "response.output_item.added", "output_index": 1,
+         "item": {"id": "msg_f", "type": "message"}},
+        {"type": "response.content_part.added", "output_index": 1, "item_id": "msg_f",
+         "content_index": 0, "part": {"type": "output_text"}},
+        {"type": "response.output_text.delta", "output_index": 1, "item_id": "msg_f",
+         "content_index": 0, "delta": "partial"},
+        {"type": "response.output_item.done", "output_index": 1,
+         "item": {"id": "msg_f", "type": "message",
+                  "content": [{"type": "output_text", "text": "partial"}]}},
+        {"type": "response.failed", "response": {"id": "resp_f", "status": "failed",
+         "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+                   "output_tokens_details": {"reasoning_tokens": 11}}}},
+    ]
+
+    evs = [e for e in await run_fold(cfg, base_body, FakeResp(make_sse(events)), [])
+           if isinstance(e, dict)]
+    types = [e.get("type") for e in evs]
+    term = evs[-1]
+    check("failed terminal not forwarded", "response.failed" not in types, str(types))
+    check("failed terminal becomes incomplete",
+          term.get("type") == "response.incomplete", term.get("type"))
+    reason = ((term.get("response") or {}).get("incomplete_details") or {}).get("reason")
+    check("failed terminal reason upstream_failed", reason == "upstream_failed", str(reason))
+    leaked = any(e.get("type") == "response.output_text.delta" for e in evs)
+    check("failed terminal does not leak buffered message", not leaked)
+    out_items = (term.get("response") or {}).get("output") or []
+    check("failed terminal output is reasoning only",
+          all(it.get("type") == "reasoning" for it in out_items) and len(out_items) == 1,
+          str([it.get("type") for it in out_items]))
+    md = (term.get("response") or {}).get("metadata") or {}
+    decisions = [r.get("decision") for r in (md.get("proxy_rounds") or [])]
+    check("failed terminal decision recorded",
+          decisions == ["upstream_failed"], str(decisions))
+
+
+async def test_incomplete_terminal_no_buffer_flush():
+    cfg = load_config(ROOT / "config.toml")
+    base_body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "q"}]}
+    events = [
+        {"type": "response.created", "response": {"id": "resp_i", "status": "in_progress"}},
+        {"type": "response.output_item.added", "output_index": 0,
+         "item": {"id": "rs_i", "type": "reasoning"}},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {"id": "rs_i", "type": "reasoning", "encrypted_content": "E"}},
+        {"type": "response.output_item.added", "output_index": 1,
+         "item": {"id": "msg_i", "type": "message"}},
+        {"type": "response.output_text.delta", "output_index": 1, "item_id": "msg_i",
+         "content_index": 0, "delta": "partial"},
+        {"type": "response.incomplete", "response": {"id": "resp_i", "status": "incomplete",
+         "incomplete_details": {"reason": "max_output_tokens"},
+         "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+                   "output_tokens_details": {"reasoning_tokens": 11}}}},
+    ]
+
+    evs = [e for e in await run_fold(cfg, base_body, FakeResp(make_sse(events)), [])
+           if isinstance(e, dict)]
+    term = evs[-1]
+    check("upstream incomplete remains incomplete",
+          term.get("type") == "response.incomplete", term.get("type"))
+    reason = ((term.get("response") or {}).get("incomplete_details") or {}).get("reason")
+    check("upstream incomplete reason normalized",
+          reason == "upstream_incomplete", str(reason))
+    leaked = any(e.get("type") == "response.output_text.delta" for e in evs)
+    check("upstream incomplete does not leak buffered message", not leaked)
+    md = (term.get("response") or {}).get("metadata") or {}
+    decisions = [r.get("decision") for r in (md.get("proxy_rounds") or [])]
+    check("upstream incomplete decision recorded",
+          decisions == ["upstream_incomplete"], str(decisions))
+
+
+async def test_upstream_round_timeout_incomplete_despite_events():
+    base = load_config(ROOT / "config.toml")
+    cfg = replace(
+        base,
+        stream=replace(
+            base.stream,
+            upstream_event_timeout_seconds=1,
+            upstream_round_timeout_seconds=0.03,
+        ),
+    )
+    base_body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "q"}]}
+    events = [
+        {"type": "response.created", "response": {"id": "resp_rt", "status": "in_progress"}},
+        {"type": "response.in_progress", "response": {"id": "resp_rt"}},
+        {"type": "response.output_item.added", "output_index": 0,
+         "item": {"id": "rs_rt", "type": "reasoning"}},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {"id": "rs_rt", "type": "reasoning", "encrypted_content": "E"}},
+        {"type": "response.output_item.added", "output_index": 1,
+         "item": {"id": "msg_rt", "type": "message"}},
+        {"type": "response.output_text.delta", "output_index": 1, "item_id": "msg_rt",
+         "content_index": 0, "delta": "partial"},
+    ]
+    keep_progress = {"type": "response.in_progress", "response": {"id": "resp_rt"}}
+
+    evs = [e for e in await run_fold(
+        cfg,
+        base_body,
+        SlowEventsResp(make_sse(events), keep_progress, delay=0.005),
+        [],
+    ) if isinstance(e, dict)]
+    term = evs[-1]
+    check("round timeout terminal is incomplete",
+          term.get("type") == "response.incomplete", term.get("type"))
+    reason = ((term.get("response") or {}).get("incomplete_details") or {}).get("reason")
+    check("round timeout reason upstream_round_timeout",
+          reason == "upstream_round_timeout", str(reason))
+    leaked = any(e.get("type") == "response.output_text.delta" for e in evs)
+    check("round timeout does not leak buffered message", not leaked)
+    md = (term.get("response") or {}).get("metadata") or {}
+    decisions = [r.get("decision") for r in (md.get("proxy_rounds") or [])]
+    check("round timeout decision recorded",
+          decisions == ["upstream_round_timeout"], str(decisions))
+
+
 # --- runner -----------------------------------------------------------------
 
 
@@ -709,8 +1097,14 @@ async def _main():
     test_auth_injection()
     test_reasoning_gate()
     test_model_prefix_gate()
+    test_request_audit_store_records_schema()
+    test_compat_normalizes_input_arguments_safely()
     test_stateful_repair()
     await test_eof_incomplete()
+    await test_upstream_event_timeout_incomplete()
+    await test_failed_terminal_incomplete_no_buffer_flush()
+    await test_incomplete_terminal_no_buffer_flush()
+    await test_upstream_round_timeout_incomplete_despite_events()
 
 
 def main():

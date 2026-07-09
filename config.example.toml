@@ -49,7 +49,22 @@ max_total_output_tokens = 0        # optional cumulative cost cap across rounds 
 force_include_encrypted = true     # add reasoning.encrypted_content upstream; always forwarded downstream
 rechunk_final_answer = true        # re-slice the buffered final message into small synthetic deltas
 rechunk_size = 16
+upstream_event_timeout_seconds = 300 # max seconds to wait for the next parsed SSE data event
+                                     # (SSE comments/keepalives do not count; 0 disables)
+upstream_round_timeout_seconds = 480 # max wall-clock seconds for one upstream round, even if
+                                     # parseable SSE events keep arriving; 0 disables
 
 [log]
 level = "info"
 dump_rounds_dir = ""               # if set, dump per-round upstream SSE (codex_mw_r{n}.sse.txt)
+
+[request_log]
+enabled = false                    # write structured request-body audit records to SQLite
+path = "logs/request_audit.sqlite3" # relative paths resolve from config.toml's directory
+store_body = true                  # store original request body as compressed bytes
+max_body_bytes = 8388608           # larger bodies are stored as a compressed prefix and marked truncated
+preview_chars = 240                # short previews for fields like input[i].arguments; 0 = hash/length only
+
+[compat]
+normalize_input_arguments = false  # convert call-like input[i].arguments from JSON-object strings
+                                   # to objects before forwarding; original bytes remain in audit DB

@@ -132,6 +132,44 @@ chatgpt_account_id = ""            # 非空时作为 chatgpt-account-id 发送
 
 下游编码代理只会看到一个 response；隐藏轮次的细节会写入最终响应的 metadata。
 
+## 流式超时
+
+可以通过 `[stream].upstream_event_timeout_seconds` 限制单个上游 round 等待下一条解析后 SSE `data:` 事件的最长时间。通过 `[stream].upstream_round_timeout_seconds` 限制单个 round 的总耗时，即使上游持续发出可解析 SSE 事件也会生效：
+
+```toml
+[stream]
+upstream_event_timeout_seconds = 300
+upstream_round_timeout_seconds = 480
+```
+
+SSE comment / keepalive 不算进展。触发超时后，中间件会发出 `response.incomplete`，其中 `incomplete_details.reason` 为 `"upstream_event_timeout"` 或 `"upstream_round_timeout"`，并且不会冲刷尚未被 terminal event 确认的暂定 message / tool 输出。
+
+## 请求审计日志
+
+可以启用独立 SQLite 请求审计库，用于排查上游 `400` / schema 不兼容问题：
+
+```toml
+[request_log]
+enabled = true
+path = "logs/request_audit.sqlite3"
+store_body = true
+max_body_bytes = 8388608
+preview_chars = 240
+```
+
+审计库会写入请求级元数据、压缩后的原始 body、逐项拆解的 `input[i]`、`tools[i]`，以及 schema findings。它不会保存 `Authorization` / `Cookie` 等请求头。`request_input_items` 表能直接看到每个历史项的 `type`、`name`、`arguments_type`、`arguments_json_type`，例如定位 `input[83].arguments` 是 `string` 还是 `object`。
+
+## 兼容性归一化
+
+有些 Responses 兼容上游要求历史 call item 的 `arguments` 是 JSON object，但 Codex 客户端可能会把它们回放成 JSON 字符串。可以只针对这类上游打开兼容转换：
+
+```toml
+[compat]
+normalize_input_arguments = true
+```
+
+开启后，仅转换 call-like `input[i]` 中 `arguments` 为字符串、且能严格解析为 JSON object 的字段。非法 JSON、非 object JSON、重复 key 对象、已经是 object 的值，以及无关字段都会保持原样。原始请求 bytes 仍保存在审计库，转换/跳过决策会写入 `request_compat_actions`。
+
 ## 响应 metadata
 
 最终重构响应会包含代理相关 metadata，例如：
@@ -161,7 +199,9 @@ uv run python tests/test_middleware.py
 - header 透明转发
 - 上游 URL 解析
 - 鉴权安全保护
-- EOF / 上游错误处理
+- EOF / 上游错误 / failed terminal / 流式超时处理
+- 请求审计 SQLite 结构化记录
+- `input[i].arguments` 兼容性归一化
 
 ## 项目结构
 
@@ -171,6 +211,7 @@ middleware/
   codex.py     # 截断数学和续写 payload 构造
   config.py    # config.toml 加载和 dataclass 配置
   creds.py     # 上游 header / auth 构造
+  audit.py     # 独立 SQLite 请求审计
   proxy.py     # fold_stream 状态机
   sse.py       # 增量 SSE 解析和序列化
   store.py     # 可选 stateful repair 使用的内存 ID 存储

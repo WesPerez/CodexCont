@@ -70,12 +70,42 @@ class StreamCfg:
     force_include_encrypted: bool = True
     rechunk_final_answer: bool = True
     rechunk_size: int = 8
+    # Seconds to wait for the next parsed SSE data event from upstream. Comments
+    # such as ":" keepalives do not count as progress. 0 disables the guard.
+    upstream_event_timeout_seconds: float = 0
+    # Seconds to allow one upstream round to run in wall-clock time, even if it
+    # keeps emitting parseable SSE events. 0 disables the guard.
+    upstream_round_timeout_seconds: float = 0
 
 
 @dataclass(frozen=True)
 class LogCfg:
     level: str = "info"
     dump_rounds_dir: str = ""
+
+
+@dataclass(frozen=True)
+class RequestLogCfg:
+    enabled: bool = False
+    # Independent SQLite DB used for request-body audit records. Relative paths
+    # resolve against the directory containing config.toml.
+    path: str = "logs/request_audit.sqlite3"
+    # Store the original request body as zlib-compressed bytes. The structured
+    # summary tables are still written when this is false.
+    store_body: bool = True
+    # Bodies above this size are stored as a compressed prefix and marked
+    # truncated; structured summaries are still computed from the parsed body.
+    max_body_bytes: int = 8 * 1024 * 1024
+    # Preview characters for short fields such as function_call.arguments.
+    # Set to 0 to store only length/hash/type.
+    preview_chars: int = 240
+
+
+@dataclass(frozen=True)
+class CompatCfg:
+    # Convert call-like input items whose `arguments` field is a JSON object
+    # encoded as a string into a real object before forwarding upstream.
+    normalize_input_arguments: bool = False
 
 
 @dataclass(frozen=True)
@@ -86,6 +116,8 @@ class Config:
     cont: ContinueCfg = field(default_factory=ContinueCfg)
     stream: StreamCfg = field(default_factory=StreamCfg)
     log: LogCfg = field(default_factory=LogCfg)
+    request_log: RequestLogCfg = field(default_factory=RequestLogCfg)
+    compat: CompatCfg = field(default_factory=CompatCfg)
     # Directory config.toml lived in (for resolving relative paths if needed).
     root: Path = field(default_factory=lambda: Path.cwd())
 
@@ -115,6 +147,8 @@ def load_config(path: str | Path) -> Config:
     cont = _section(data, "continue")
     stream = _section(data, "stream")
     log = _section(data, "log")
+    request_log = _section(data, "request_log")
+    compat = _section(data, "compat")
 
     # listen_paths is a list in TOML; store as tuple.
     if "listen_paths" in server and isinstance(server["listen_paths"], list):
@@ -134,6 +168,8 @@ def load_config(path: str | Path) -> Config:
         cont=ContinueCfg(**_only_known(ContinueCfg, cont)),
         stream=StreamCfg(**_only_known(StreamCfg, stream)),
         log=LogCfg(**_only_known(LogCfg, log)),
+        request_log=RequestLogCfg(**_only_known(RequestLogCfg, request_log)),
+        compat=CompatCfg(**_only_known(CompatCfg, compat)),
         root=path.resolve().parent if path.exists() else Path.cwd(),
     )
 

@@ -8,8 +8,10 @@ gate — message and function_call output are treated identically.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 
@@ -24,6 +26,7 @@ from .codex import (
     should_continue,
     tier_n,
 )
+from .compat import normalize_request_body
 from .config import Config
 from .sse import DONE, incremental_sse, serialize_done, serialize_event
 
@@ -96,6 +99,51 @@ def _fmt_usage(usage: dict[str, Any] | None) -> str:
         f"out={u.get('output_tokens')} reason={otd.get('reasoning_tokens')} "
         f"total={u.get('total_tokens')}"
     )
+
+
+def _timeout_seconds(value: Any) -> float:
+    try:
+        seconds = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return seconds if seconds > 0 else 0.0
+
+
+def _normalize_payload_for_upstream(
+    cfg: Config,
+    payload: dict[str, Any],
+    *,
+    trace: str,
+    req: str,
+    round_no: int,
+) -> dict[str, Any]:
+    result = normalize_request_body(payload, cfg.compat)
+    if result.actions:
+        normalized = [a.path for a in result.actions if a.action == "normalized"]
+        skipped = [f"{a.path}:{a.code}" for a in result.actions if a.action == "skipped"]
+        log.info(
+            "compat normalize trace=%s req=%s phase=continuation-round-%d "
+            "changed=%d skipped=%d normalized=%s skipped_paths=%s",
+            trace,
+            req,
+            round_no,
+            result.changed_count,
+            result.skipped_count,
+            normalized[:20],
+            skipped[:20],
+        )
+    return result.body
+
+
+def _terminal_stop_reason(terminal: dict[str, Any] | None) -> str | None:
+    if not terminal:
+        return None
+    t = terminal.get("type")
+    if t == "response.failed":
+        return "upstream_failed"
+    if t == "response.incomplete":
+        return "upstream_incomplete"
+    return None
 
 
 def _find_buffer(buf: list[dict[str, Any]], up_oi: Any) -> dict[str, Any] | None:
@@ -294,6 +342,8 @@ async def fold_stream(
     first_response: httpx.Response,
     id_store: Any | None = None,
     url: str | None = None,
+    trace_id: str = "",
+    request_id: str = "",
 ) -> AsyncIterator[bytes]:
     """Yield the folded downstream SSE byte stream. `first_response` is the
     already-opened (2xx) round-1 upstream response; later rounds are opened here
@@ -304,6 +354,11 @@ async def fold_stream(
     cont = cfg.cont
     url = url or cfg.upstream.url
     orig_input = list(base_body.get("input") or [])
+    trace = trace_id or "-"
+    req = request_id or "-"
+    started_at = time.monotonic()
+    upstream_event_timeout = _timeout_seconds(cfg.stream.upstream_event_timeout_seconds)
+    upstream_round_timeout = _timeout_seconds(cfg.stream.upstream_round_timeout_seconds)
 
     seq = _Seq()
     ds_oi = 0
@@ -322,6 +377,7 @@ async def fold_stream(
     try:
         while True:
             round_no += 1
+            round_started_at = time.monotonic()
             oi_map: dict[Any, int] = {}
             item_kind: dict[Any, str] = {}
             out_buffer: list[dict[str, Any]] = []
@@ -335,7 +391,68 @@ async def fold_stream(
                 dump_dir.mkdir(parents=True, exist_ok=True)
                 byte_src = _tee(byte_src, dump_dir / f"codex_mw_r{round_no}.sse.txt")
 
-            async for ev in incremental_sse(byte_src):
+            sse_iter = incremental_sse(byte_src).__aiter__()
+            round_deadline = (
+                round_started_at + upstream_round_timeout
+                if upstream_round_timeout else None
+            )
+            while True:
+                try:
+                    read_timeout = upstream_event_timeout
+                    if round_deadline is not None:
+                        round_remaining = round_deadline - time.monotonic()
+                        if round_remaining <= 0:
+                            raise asyncio.TimeoutError
+                        read_timeout = (
+                            min(read_timeout, round_remaining)
+                            if read_timeout else round_remaining
+                        )
+                    if read_timeout:
+                        ev = await asyncio.wait_for(sse_iter.__anext__(), timeout=read_timeout)
+                    else:
+                        ev = await sse_iter.__anext__()
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    timeout_reason = "upstream_event_timeout"
+                    if round_deadline is not None and time.monotonic() >= round_deadline - 0.001:
+                        timeout_reason = "upstream_round_timeout"
+                    round_elapsed = time.monotonic() - round_started_at
+                    rt = reasoning_tokens(usage)
+                    n = tier_n(rt, cont.truncation_step)
+                    rounds_info.append({
+                        "round": round_no,
+                        "reasoning_tokens": rt,
+                        "n": n,
+                        "has_encrypted_content": bool(
+                            round_reasoning and round_reasoning[-1].get("encrypted_content")
+                        ),
+                        "decision": timeout_reason,
+                        "elapsed_seconds": round(round_elapsed, 3),
+                    })
+                    await response.aclose()
+                    timeout_label = (
+                        f"round timeout after {upstream_round_timeout:.3g}s"
+                        if timeout_reason == "upstream_round_timeout"
+                        else f"event timeout after {upstream_event_timeout:.3g}s"
+                    )
+                    log.warning(
+                        "round trace=%s req=%s %d: upstream %s",
+                        trace, req, round_no, timeout_label,
+                    )
+                    log.info(
+                        "done trace=%s req=%s: %d round(s) | %s | status=incomplete "
+                        "stop=%s elapsed=%.1fs",
+                        trace, req, round_no, _fmt_usage(total_usage), timeout_reason,
+                        time.monotonic() - started_at,
+                    )
+                    yield serialize_event(
+                        _synthetic_incomplete(
+                            base_response, final_output,
+                            _agent_usage(first_usage, total_usage, usage, flushed_final=False),
+                            seq(), timeout_reason, rounds_info, total_usage)
+                    )
+                    return
                 if ev is DONE:
                     saw_done = True
                     continue
@@ -397,7 +514,9 @@ async def fold_stream(
                     yield serialize_event(ev)
 
             # --- round ended: decide -------------------------------------
+            round_elapsed = time.monotonic() - round_started_at
             saw_terminal = terminal is not None
+            terminal_stop_reason = _terminal_stop_reason(terminal)
             _sum_usage(total_usage, usage)
             if round_no == 1:
                 first_usage = usage
@@ -427,6 +546,7 @@ async def fold_stream(
             do_continue = (
                 cont.enabled
                 and saw_terminal
+                and terminal_stop_reason is None
                 and continue_reason is not None
                 and has_enc
                 and round_no <= cont.max_continue
@@ -448,6 +568,7 @@ async def fold_stream(
             decision = (
                 f"continue:{continue_reason}" if do_continue
                 else "upstream_eof" if not saw_terminal
+                else terminal_stop_reason if terminal_stop_reason is not None
                 else stopped_reason or "clean"
             )
             rounds_info.append({
@@ -456,9 +577,11 @@ async def fold_stream(
                 "n": n,
                 "has_encrypted_content": has_enc,
                 "decision": decision,
+                "elapsed_seconds": round(round_elapsed, 3),
             })
-            log.info("round %d: %s | n=%s buffered=%s -> %s",
-                     round_no, _fmt_usage(usage), n, buffered or "[]", decision)
+            log.info("round trace=%s req=%s %d: %s | n=%s buffered=%s -> %s elapsed=%.1fs",
+                     trace, req, round_no, _fmt_usage(usage), n, buffered or "[]",
+                     decision, round_elapsed)
 
             await response.aclose()
 
@@ -501,14 +624,21 @@ async def fold_stream(
                     force_include_encrypted=cfg.stream.force_include_encrypted,
                     drop_previous_response_id=True,
                 )
+                payload = _normalize_payload_for_upstream(
+                    cfg, payload, trace=trace, req=req, round_no=round_no + 1
+                )
                 response = await open_round(client, url, payload, headers)
                 if response.status_code >= 400:
                     body = (await response.aread())[:2000]
                     await response.aclose()
-                    log.warning("continuation round %d failed: %s %s", round_no + 1,
-                                response.status_code, body)
-                    log.info("done: %d round(s) | %s | status=incomplete stop=upstream_error",
-                             round_no, _fmt_usage(total_usage))
+                    log.warning("continuation trace=%s req=%s round %d failed: %s %s",
+                                trace, req, round_no + 1, response.status_code, body)
+                    log.info(
+                        "done trace=%s req=%s: %d round(s) | %s | status=incomplete "
+                        "stop=upstream_error elapsed=%.1fs",
+                        trace, req, round_no, _fmt_usage(total_usage),
+                        time.monotonic() - started_at,
+                    )
                     yield serialize_event(
                         _synthetic_incomplete(
                             base_response, final_output,
@@ -524,14 +654,40 @@ async def fold_stream(
                 # buffered tentative output (message / tool calls) — it is not a
                 # real final answer. Keep only the reasoning already live-streamed
                 # and mark the response incomplete (#7).
-                log.warning("round %d: upstream EOF with no terminal event", round_no)
-                log.info("done: %d round(s) | %s | status=incomplete stop=upstream_eof",
-                         round_no, _fmt_usage(total_usage))
+                log.warning("round trace=%s req=%s %d: upstream EOF with no terminal event",
+                            trace, req, round_no)
+                log.info(
+                    "done trace=%s req=%s: %d round(s) | %s | status=incomplete "
+                    "stop=upstream_eof elapsed=%.1fs",
+                    trace, req, round_no, _fmt_usage(total_usage),
+                    time.monotonic() - started_at,
+                )
                 yield serialize_event(
                     _synthetic_incomplete(
                         base_response, final_output,
                         _agent_usage(first_usage, total_usage, usage, flushed_final=False),
                         seq(), "upstream_eof", rounds_info, total_usage)
+                )
+                return
+
+            if terminal_stop_reason is not None:
+                terminal_type = (terminal or {}).get("type", "")
+                terminal_status = ((terminal or {}).get("response") or {}).get("status")
+                log.warning(
+                    "round trace=%s req=%s %d: upstream terminal %s status=%s -> incomplete",
+                    trace, req, round_no, terminal_type, terminal_status,
+                )
+                log.info(
+                    "done trace=%s req=%s: %d round(s) | %s | status=incomplete "
+                    "stop=%s elapsed=%.1fs",
+                    trace, req, round_no, _fmt_usage(total_usage), terminal_stop_reason,
+                    time.monotonic() - started_at,
+                )
+                yield serialize_event(
+                    _synthetic_incomplete(
+                        base_response, final_output,
+                        _agent_usage(first_usage, total_usage, usage, flushed_final=False),
+                        seq(), terminal_stop_reason, rounds_info, total_usage)
                 )
                 return
 
@@ -543,8 +699,9 @@ async def fold_stream(
                 final_output.append(entry["item"])
 
             status = ((terminal or {}).get("response") or {}).get("status", "completed")
-            log.info("done: %d round(s) | %s | status=%s stop=%s",
-                     round_no, _fmt_usage(total_usage), status, stopped_reason or "natural")
+            log.info("done trace=%s req=%s: %d round(s) | %s | status=%s stop=%s elapsed=%.1fs",
+                     trace, req, round_no, _fmt_usage(total_usage), status,
+                     stopped_reason or "natural", time.monotonic() - started_at)
             yield serialize_event(
                 _reconstruct_terminal(
                     terminal, base_response, final_output,
@@ -556,9 +713,12 @@ async def fold_stream(
             return
 
     except (httpx.HTTPError, ConnectionError) as exc:
-        log.warning("upstream error mid-stream (round %d): %r", round_no, exc)
-        log.info("done: %d round(s) | %s | status=incomplete stop=upstream_error",
-                 round_no, _fmt_usage(total_usage))
+        log.warning("upstream error trace=%s req=%s mid-stream (round %d): %r",
+                    trace, req, round_no, exc)
+        log.info("done trace=%s req=%s: %d round(s) | %s | status=incomplete "
+                 "stop=upstream_error elapsed=%.1fs",
+                 trace, req, round_no, _fmt_usage(total_usage),
+                 time.monotonic() - started_at)
         yield serialize_event(
             _synthetic_incomplete(
                 base_response, final_output,

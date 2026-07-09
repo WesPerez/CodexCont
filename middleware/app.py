@@ -6,9 +6,11 @@ so it is safe in front of all traffic.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
+import uuid
 from typing import Any
 
 import httpx
@@ -17,12 +19,14 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from .audit import RequestAuditStore
 from .codex import (
     build_round_payload,
     declares_continue_tool,
     reasoning_enabled,
     repair_followup_input,
 )
+from .compat import CompatAction, CompatResult, normalize_request_body
 from .config import Config
 from .creds import build_upstream_headers, would_inject_authorization
 from .proxy import fold_stream, open_passthrough, open_round
@@ -78,12 +82,31 @@ def _model_allowed_to_fold(cfg: Config, model: Any) -> bool:
     return isinstance(model, str) and model.startswith(prefixes)
 
 
+def _request_trace_id(request: Request) -> str:
+    for name in ("x-client-request-id", "x-request-id"):
+        value = request.headers.get(name)
+        if value and value.strip():
+            return value.strip()
+    return str(uuid.uuid4())
+
+
 async def _passthrough(
-    client: httpx.AsyncClient, cfg: Config, request: Request, raw: bytes, url: str
+    client: httpx.AsyncClient,
+    cfg: Config,
+    request: Request,
+    raw: bytes,
+    url: str,
+    audit_id: int | None = None,
 ):
     """Pure proxy: forward the raw request and stream the raw response back."""
     headers = build_upstream_headers(request.headers.items(), cfg)
     resp = await open_passthrough(client, url, raw, headers)
+    await _audit_response(
+        request,
+        audit_id,
+        upstream_status_code=resp.status_code,
+        downstream_status_code=resp.status_code,
+    )
 
     async def body_iter():
         try:
@@ -99,20 +122,167 @@ async def _passthrough(
     )
 
 
+async def _audit_request(
+    request: Request,
+    *,
+    trace_id: str,
+    request_id: str,
+    raw: bytes,
+    body: dict[str, Any] | None,
+    parse_error: str | None,
+    upstream_url: str | None,
+    decision: str,
+) -> int | None:
+    store: RequestAuditStore | None = getattr(request.app.state, "request_audit", None)
+    if store is None:
+        return None
+    try:
+        client_host = request.client.host if request.client else None
+        return await asyncio.to_thread(
+            store.record_request,
+            trace_id=trace_id,
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            client_host=client_host,
+            user_agent=request.headers.get("user-agent"),
+            content_type=request.headers.get("content-type"),
+            upstream_url=upstream_url,
+            decision=decision,
+            raw_body=raw,
+            body=body,
+            parse_error=parse_error,
+        )
+    except Exception:
+        log.exception("request audit insert failed trace=%s req=%s", trace_id, request_id)
+        return None
+
+
+async def _audit_response(
+    request: Request,
+    audit_id: int | None,
+    *,
+    upstream_status_code: int | None = None,
+    downstream_status_code: int | None = None,
+    response_error: str | None = None,
+) -> None:
+    if audit_id is None:
+        return
+    store: RequestAuditStore | None = getattr(request.app.state, "request_audit", None)
+    if store is None:
+        return
+    try:
+        await asyncio.to_thread(
+            store.update_response,
+            audit_id,
+            upstream_status_code=upstream_status_code,
+            downstream_status_code=downstream_status_code,
+            response_error=response_error,
+        )
+    except Exception:
+        log.exception("request audit update failed id=%s", audit_id)
+
+
+async def _audit_compat_actions(
+    request: Request,
+    audit_id: int | None,
+    actions: tuple[CompatAction, ...],
+) -> None:
+    if audit_id is None or not actions:
+        return
+    store: RequestAuditStore | None = getattr(request.app.state, "request_audit", None)
+    if store is None:
+        return
+    try:
+        await asyncio.to_thread(store.record_compat_actions, audit_id, actions)
+    except Exception:
+        log.exception("request compat audit failed id=%s", audit_id)
+
+
+def _log_compat_result(
+    result: CompatResult,
+    *,
+    trace_id: str,
+    request_id: str,
+    phase: str,
+) -> None:
+    if not result.actions:
+        return
+    normalized = [a.path for a in result.actions if a.action == "normalized"]
+    skipped = [f"{a.path}:{a.code}" for a in result.actions if a.action == "skipped"]
+    log.info(
+        "compat normalize trace=%s req=%s phase=%s changed=%d skipped=%d "
+        "normalized=%s skipped_paths=%s",
+        trace_id,
+        request_id,
+        phase,
+        result.changed_count,
+        result.skipped_count,
+        normalized[:20],
+        skipped[:20],
+    )
+
+
+def _body_bytes(body: dict[str, Any]) -> bytes:
+    return json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+
 async def handle_responses(request: Request) -> Response:
     cfg: Config = request.app.state.cfg
     client: httpx.AsyncClient = request.app.state.client
 
+    trace_id = _request_trace_id(request)
+    request_id = str(uuid.uuid4())
     raw = await request.body()
     try:
         body: dict[str, Any] = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):
+        audit_id = await _audit_request(
+            request,
+            trace_id=trace_id,
+            request_id=request_id,
+            raw=raw,
+            body=None,
+            parse_error="invalid_json",
+            upstream_url=None,
+            decision="reject:invalid_json",
+        )
+        await _audit_response(
+            request, audit_id, downstream_status_code=400, response_error="invalid JSON body"
+        )
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
     if not isinstance(body, dict):
+        audit_id = await _audit_request(
+            request,
+            trace_id=trace_id,
+            request_id=request_id,
+            raw=raw,
+            body=None,
+            parse_error="body_not_object",
+            upstream_url=None,
+            decision="reject:body_not_object",
+        )
+        await _audit_response(
+            request, audit_id, downstream_status_code=400, response_error="body must be a JSON object"
+        )
         return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
 
     url = _resolve_upstream_url(cfg, request)
     if url is None:
+        audit_id = await _audit_request(
+            request,
+            trace_id=trace_id,
+            request_id=request_id,
+            raw=raw,
+            body=body,
+            parse_error=None,
+            upstream_url=None,
+            decision="reject:missing_upstream_header",
+        )
+        await _audit_response(
+            request, audit_id, downstream_status_code=400,
+            response_error="Responses-API-Base header is required",
+        )
         return JSONResponse(
             {"error": "Responses-API-Base header is required (upstream mode=header_required)"},
             status_code=400,
@@ -126,6 +296,20 @@ async def handle_responses(request: Request) -> Response:
     ):
         log.warning("blocked: Responses-API-Base override without own auth (model=%s)",
                     body.get("model"))
+        audit_id = await _audit_request(
+            request,
+            trace_id=trace_id,
+            request_id=request_id,
+            raw=raw,
+            body=body,
+            parse_error=None,
+            upstream_url=url,
+            decision="reject:unsafe_auth_injection",
+        )
+        await _audit_response(
+            request, audit_id, downstream_status_code=400,
+            response_error="Responses-API-Base override without own auth",
+        )
         return JSONResponse(
             {"error": "When overriding the upstream base (Responses-API-Base), the request must "
                       "provide its own Authorization; the proxy will not send its configured "
@@ -156,12 +340,42 @@ async def handle_responses(request: Request) -> Response:
                else "non-reasoning" if not reasoning_enabled(body)
                else "model-not-matched" if not model_allowed
                else "declares-continue_thinking")
+        audit_id = await _audit_request(
+            request,
+            trace_id=trace_id,
+            request_id=request_id,
+            raw=raw,
+            body=body,
+            parse_error=None,
+            upstream_url=url,
+            decision=f"passthrough:{why}",
+        )
+        compat = normalize_request_body(body, cfg.compat)
+        _log_compat_result(compat, trace_id=trace_id, request_id=request_id, phase="passthrough")
+        await _audit_compat_actions(request, audit_id, compat.actions)
+        forward_raw = _body_bytes(compat.body) if compat.changed_count else raw
         log.info("passthrough (%s): model=%s path=%s url=%s",
                  why, body.get("model"), request.url.path, url)
-        return await _passthrough(client, cfg, request, raw, url)
+        return await _passthrough(client, cfg, request, forward_raw, url, audit_id=audit_id)
 
-    log.info("fold start: model=%s path=%s url=%s input_items=%d",
-             body.get("model"), request.url.path, url, len(body.get("input") or []))
+    audit_id = await _audit_request(
+        request,
+        trace_id=trace_id,
+        request_id=request_id,
+        raw=raw,
+        body=body,
+        parse_error=None,
+        upstream_url=url,
+        decision="fold",
+    )
+    log.info("fold start trace=%s req=%s: model=%s path=%s url=%s input_items=%d",
+             trace_id, request_id, body.get("model"), request.url.path, url,
+             len(body.get("input") or []))
+
+    compat = normalize_request_body(body, cfg.compat)
+    _log_compat_result(compat, trace_id=trace_id, request_id=request_id, phase="fold-request")
+    await _audit_compat_actions(request, audit_id, compat.actions)
+    body = compat.body
 
     # repair_followup="stateful": re-insert tool_pair continue pairs after recorded
     # ids (tool_pair only — commentary preserves cross-turn structure via forward_marker).
@@ -183,10 +397,24 @@ async def handle_responses(request: Request) -> Response:
         force_include_encrypted=cfg.stream.force_include_encrypted,
         drop_previous_response_id=False,  # round 1 passes it through
     )
+    payload_compat = normalize_request_body(payload, cfg.compat)
+    _log_compat_result(
+        payload_compat,
+        trace_id=trace_id,
+        request_id=request_id,
+        phase="fold-round-1",
+    )
+    payload = payload_compat.body
 
     # Open round 1 here so a non-2xx (e.g. bad auth) is mirrored with its real
     # status code rather than buried inside a 200 SSE stream.
     resp = await open_round(client, url, payload, headers)
+    await _audit_response(
+        request,
+        audit_id,
+        upstream_status_code=resp.status_code,
+        downstream_status_code=resp.status_code if resp.status_code >= 400 else 200,
+    )
     if resp.status_code >= 400:
         err = await resp.aread()
         await resp.aclose()
@@ -195,7 +423,17 @@ async def handle_responses(request: Request) -> Response:
         )
 
     return StreamingResponse(
-        fold_stream(client, cfg, body, headers, resp, request.app.state.id_store, url=url),
+        fold_stream(
+            client,
+            cfg,
+            body,
+            headers,
+            resp,
+            request.app.state.id_store,
+            url=url,
+            trace_id=trace_id,
+            request_id=request_id,
+        ),
         media_type="text/event-stream",
     )
 
@@ -217,9 +455,15 @@ def create_app(cfg: Config) -> Starlette:
         app.state.cfg = cfg
         app.state.client = _make_client()
         app.state.id_store = IdStore()
+        app.state.request_audit = (
+            RequestAuditStore(cfg.request_log, cfg.root)
+            if cfg.request_log.enabled else None
+        )
         try:
             yield
         finally:
+            if app.state.request_audit is not None:
+                app.state.request_audit.close()
             await app.state.client.aclose()
 
     routes = [

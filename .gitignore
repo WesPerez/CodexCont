@@ -18,5 +18,6 @@ __pycache__/
 config.toml
 rt.json
 free_rt.json
+logs/
 
 legacy/
