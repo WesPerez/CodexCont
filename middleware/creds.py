@@ -25,6 +25,11 @@ _CLIENT_OWNED = {
     "proxy-connection",
     "transfer-encoding",
     "accept-encoding",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "upgrade",
 }
 
 _AUTH = "authorization"
@@ -57,6 +62,8 @@ def would_inject_authorization(cfg: Config, *, agent_has_authorization: bool) ->
 def build_upstream_headers(
     agent_headers: Iterable[tuple[str, str]],
     cfg: Config,
+    *,
+    allow_config_credentials: bool = True,
 ) -> dict[str, str]:
     """Construct the headers sent upstream from the agent's request headers.
 
@@ -66,23 +73,35 @@ def build_upstream_headers(
     per the auth mode. An empty account_id means the header is never added
     (e.g. plain Responses endpoints that don't use it).
     """
+    pairs = list(agent_headers)
+    connection_tokens: set[str] = set()
+    for name, value in pairs:
+        if name.lower() == "connection":
+            connection_tokens.update(
+                token.strip().lower()
+                for token in value.split(",")
+                if token.strip()
+            )
+
     out: dict[str, str] = {}
-    for name, value in agent_headers:
+    for name, value in pairs:
         lname = name.lower()
-        if lname in _CLIENT_OWNED or lname in _PROXY_CONTROL:
+        if lname in _CLIENT_OWNED or lname in _PROXY_CONTROL or lname in connection_tokens:
             continue  # drop client-owned/hop-by-hop + proxy control headers
         out[name] = value
 
-    if would_inject_authorization(cfg, agent_has_authorization=_has(out, _AUTH)):
-        _set(out, "Authorization", f"Bearer {cfg.auth.access_token}")
+    if allow_config_credentials:
+        if would_inject_authorization(cfg, agent_has_authorization=_has(out, _AUTH)):
+            _set(out, "Authorization", f"Bearer {cfg.auth.access_token}")
 
-    account = cfg.auth.chatgpt_account_id
-    if account and _should_inject(cfg.auth.mode, _has(out, _ACCOUNT)):
-        _set(out, "chatgpt-account-id", account)
+        account = cfg.auth.chatgpt_account_id
+        if account and _should_inject(cfg.auth.mode, _has(out, _ACCOUNT)):
+            _set(out, "chatgpt-account-id", account)
 
-    # Optional explicit overrides, applied last.
-    for name, value in cfg.upstream.headers.items():
-        _set(out, name, value)
+        # Optional explicit overrides are operator-owned and must never be sent
+        # to a request-selected destination.
+        for name, value in cfg.upstream.headers.items():
+            _set(out, name, value)
 
     return out
 

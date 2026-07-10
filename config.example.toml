@@ -1,11 +1,15 @@
 [server]
 host = "127.0.0.1"
 port = 8787
+max_request_body_bytes = 33554432 # application-layer cap; 0 disables it
 listen_paths = ["/v1/responses", "/responses"]
 
 [upstream]
 url = "https://chatgpt.com/backend-api/codex/responses"
 mode = "header"                    # "fixed" = always use url; "header" = Responses-API-Base header (a BASE url, /responses appended) overrides url (else url); "header_required" = header MUST be present (else 400). Header is stripped before forwarding.
+dynamic_allowed_origins = ["https://api.openai.com", "https://chatgpt.com"] # exact origins allowed in Responses-API-Base; empty disables dynamic targets
+dynamic_allow_private_ips = false   # fixed URLs may be private; header-selected targets may not unless explicitly enabled
+trust_env = false                   # ignore ambient HTTP(S)_PROXY unless a trusted egress proxy is required
 # OPTIONAL explicit header overrides, applied last; EMPTY by default — the proxy
 # passes the agent's headers through and invents none (no User-Agent of our own).
 [upstream.headers]
@@ -53,6 +57,15 @@ upstream_event_timeout_seconds = 300 # max seconds to wait for the next parsed S
                                      # (SSE comments/keepalives do not count; 0 disables)
 upstream_round_timeout_seconds = 480 # max wall-clock seconds for one upstream round, even if
                                      # parseable SSE events keep arriving; 0 disables
+upstream_connect_timeout_seconds = 5 # TCP/TLS connect timeout
+upstream_read_timeout_seconds = 330  # response-header and raw socket idle timeout
+upstream_write_timeout_seconds = 60  # request-body upload timeout
+upstream_pool_timeout_seconds = 5    # wait for an available pooled connection
+upstream_dns_timeout_seconds = 5     # dynamic-target DNS validation timeout
+upstream_error_body_timeout_seconds = 30 # total time allowed to read a non-2xx body
+upstream_error_body_max_bytes = 4194304  # cap buffered non-2xx response bodies
+upstream_max_connections = 256       # total HTTPX upstream connections
+upstream_max_keepalive_connections = 64 # retained idle HTTPX connections
 
 [log]
 level = "info"
@@ -62,8 +75,13 @@ dump_rounds_dir = ""               # if set, dump per-round upstream SSE (codex_
 enabled = false                    # write structured request-body audit records to SQLite
 path = "logs/request_audit.sqlite3" # relative paths resolve from config.toml's directory
 store_body = true                  # store original request body as compressed bytes
-max_body_bytes = 8388608           # larger bodies are stored as a compressed prefix and marked truncated
+max_body_bytes = 0                 # 0 stores complete request bodies without audit truncation
+background_body_writes = true      # enqueue body compression/SQLite writes off the request path
+background_max_pending_bytes = 134217728 # bounded queue; backpressure instead of silent drops
 retention_days = 7                 # automatically prune audit rows older than this many days; 0 = keep forever
+sqlite_busy_timeout_ms = 5000      # DB lock wait; keep low in latency-sensitive production deployments
+prune_interval_seconds = 0         # 0 = check every request; production can use 300 to throttle cleanup
+prune_batch_size = 0               # 0 = delete all expired rows per pass; production can use a bounded batch
 store_forwarded_body = true        # also store the actual body sent upstream after compatibility transforms
 store_response_body = "errors"     # off | errors | all; streaming responses are stored as capped compressed prefixes
 max_response_body_bytes = 1048576  # cap per stored upstream/downstream response body

@@ -15,6 +15,8 @@ from typing import Any
 class ServerCfg:
     host: str = "127.0.0.1"
     port: int = 8787
+    # Hard application-layer cap. 0 disables the cap; keep Nginx capped too.
+    max_request_body_bytes: int = 32 * 1024 * 1024
     listen_paths: tuple[str, ...] = (
         "/backend-api/codex/responses",
         "/v1/responses",
@@ -32,6 +34,14 @@ class UpstreamCfg:
     # Optional explicit header overrides applied LAST; empty by default so the
     # proxy is a pure header passthrough and invents nothing (no User-Agent).
     headers: dict[str, str] = field(default_factory=dict)
+    # Header-selected upstreams are restricted to exact origins such as
+    # "https://api.openai.com". Empty disables dynamic targets (secure default).
+    dynamic_allowed_origins: tuple[str, ...] = ()
+    # Fixed operator-configured URLs are unaffected by this private-IP policy.
+    dynamic_allow_private_ips: bool = False
+    # Ignore ambient HTTP(S)_PROXY by default so URL validation and connection
+    # routing use the same host policy. Enable only for a trusted egress proxy.
+    trust_env: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,6 +87,18 @@ class StreamCfg:
     # Seconds to allow one upstream round to run in wall-clock time, even if it
     # keeps emitting parseable SSE events. 0 disables the guard.
     upstream_round_timeout_seconds: float = 0
+    # HTTP transport guards. The read timeout also protects passthrough streams
+    # and the wait for initial response headers; fold streams keep their stricter
+    # parsed-event and round-level guards above.
+    upstream_connect_timeout_seconds: float = 5
+    upstream_read_timeout_seconds: float = 330
+    upstream_write_timeout_seconds: float = 60
+    upstream_pool_timeout_seconds: float = 5
+    upstream_dns_timeout_seconds: float = 5
+    upstream_error_body_timeout_seconds: float = 30
+    upstream_error_body_max_bytes: int = 4 * 1024 * 1024
+    upstream_max_connections: int = 256
+    upstream_max_keepalive_connections: int = 64
 
 
 @dataclass(frozen=True)
@@ -95,10 +117,23 @@ class RequestLogCfg:
     # summary tables are still written when this is false.
     store_body: bool = True
     # Bodies above this size are stored as a compressed prefix and marked
-    # truncated; structured summaries are still computed from the parsed body.
-    max_body_bytes: int = 8 * 1024 * 1024
+    # truncated; 0 disables audit truncation.
+    max_body_bytes: int = 0
+    # Persist large body artifacts through one FIFO writer so request forwarding
+    # does not wait for compression and SQLite commits in the normal case.
+    background_body_writes: bool = True
+    # Bound body bytes retained by the writer queue. When full, enqueue applies
+    # backpressure instead of silently dropping diagnostic evidence. 0 is unlimited.
+    background_max_pending_bytes: int = 128 * 1024 * 1024
     # Remove audit rows older than this many days. 0 disables automatic pruning.
     retention_days: int = 7
+    # Give up quickly when another process holds the audit DB. Auditing is
+    # diagnostic and must not stall the online request path for seconds.
+    sqlite_busy_timeout_ms: int = 5000
+    # Throttle retention work. 0 preserves the legacy every-request behavior.
+    prune_interval_seconds: int = 0
+    # Maximum expired parent rows removed per prune pass. 0 removes all.
+    prune_batch_size: int = 0
     # Also store the exact body sent upstream after compatibility transforms.
     store_forwarded_body: bool = True
     # Response-body capture: off | errors | all. Streaming bodies are capped by
@@ -177,6 +212,24 @@ def load_config(path: str | Path) -> Config:
         server = {**server, "listen_paths": tuple(server["listen_paths"])}
     if "model_prefixes" in cont and isinstance(cont["model_prefixes"], list):
         cont = {**cont, "model_prefixes": tuple(str(x) for x in cont["model_prefixes"])}
+    if (
+        "dynamic_allowed_origins" in upstream
+        and isinstance(upstream["dynamic_allowed_origins"], list)
+    ):
+        if not all(isinstance(value, str) for value in upstream["dynamic_allowed_origins"]):
+            raise ValueError("upstream.dynamic_allowed_origins entries must be strings")
+        upstream = {
+            **upstream,
+            "dynamic_allowed_origins": tuple(
+                str(x) for x in upstream["dynamic_allowed_origins"]
+            ),
+        }
+    if "dynamic_allow_private_ips" in upstream and not isinstance(
+        upstream["dynamic_allow_private_ips"], bool
+    ):
+        raise ValueError("upstream.dynamic_allow_private_ips must be a boolean")
+    if "trust_env" in upstream and not isinstance(upstream["trust_env"], bool):
+        raise ValueError("upstream.trust_env must be a boolean")
     if (
         "normalize_input_argument_item_types" in compat
         and isinstance(compat["normalize_input_argument_item_types"], list)

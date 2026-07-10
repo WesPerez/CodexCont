@@ -11,6 +11,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 import zlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -114,10 +115,17 @@ def _tool_name(tool: dict[str, Any]) -> str | None:
 
 
 class AuditBodyCapture:
-    """Incrementally hash a body while retaining only a bounded prefix."""
+    """Incrementally hash a body while retaining a bounded prefix.
 
-    def __init__(self, max_bytes: int):
-        self.max_bytes = max(0, int(max_bytes))
+    Callers may opt into treating max_bytes=0 as unlimited. By default, zero
+    retains zero bytes so response-capture configuration remains compatible.
+    """
+
+    def __init__(self, max_bytes: int, *, zero_is_unlimited: bool = False):
+        limit = int(max_bytes)
+        self.max_bytes: int | None = (
+            None if limit == 0 and zero_is_unlimited else max(0, limit)
+        )
         self.original_bytes = 0
         self.force_store = False
         self._stored_bytes = 0
@@ -129,7 +137,10 @@ class AuditBodyCapture:
             return
         self.original_bytes += len(chunk)
         self._sha.update(chunk)
-        remaining = self.max_bytes - self._stored_bytes
+        if self.max_bytes is None:
+            remaining = len(chunk)
+        else:
+            remaining = self.max_bytes - self._stored_bytes
         if remaining <= 0:
             return
         piece = chunk[:remaining]
@@ -165,10 +176,12 @@ class RequestAuditStore:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self.path = db_path
         self._lock = threading.Lock()
+        self._next_prune_at = 0.0
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        busy_timeout_ms = max(0, int(self.cfg.sqlite_busy_timeout_ms))
+        self._conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema()
 
@@ -283,6 +296,17 @@ class RequestAuditStore:
                     PRIMARY KEY (audit_id, stage, ordinal)
                 );
 
+                CREATE TABLE IF NOT EXISTS request_audit_failures (
+                    audit_id INTEGER NOT NULL REFERENCES request_audit(id) ON DELETE CASCADE,
+                    stage TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    error TEXT NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    PRIMARY KEY (audit_id, stage, ordinal)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_request_audit_created
                     ON request_audit(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_request_audit_trace
@@ -307,8 +331,29 @@ class RequestAuditStore:
             days = 0
         if days <= 0:
             return
+        interval = max(0, int(self.cfg.prune_interval_seconds))
+        now = time.monotonic()
+        if interval and now < self._next_prune_at:
+            return
+        if interval:
+            self._next_prune_at = now + interval
         cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="milliseconds")
-        self._conn.execute("DELETE FROM request_audit WHERE created_at < ?", (cutoff,))
+        batch_size = max(0, int(self.cfg.prune_batch_size))
+        if batch_size:
+            self._conn.execute(
+                """
+                DELETE FROM request_audit
+                WHERE id IN (
+                    SELECT id FROM request_audit
+                    WHERE created_at < ?
+                    ORDER BY created_at
+                    LIMIT ?
+                )
+                """,
+                (cutoff, batch_size),
+            )
+        else:
+            self._conn.execute("DELETE FROM request_audit WHERE created_at < ?", (cutoff,))
 
     def _insert_capture_locked(
         self,
@@ -318,8 +363,8 @@ class RequestAuditStore:
         ordinal: int,
         content_type: str | None,
         capture: AuditBodyCapture,
+        body_zlib: bytes,
     ) -> None:
-        stored = capture.stored_body
         self._conn.execute(
             """
             INSERT OR REPLACE INTO request_audit_bodies (
@@ -337,7 +382,7 @@ class RequestAuditStore:
                 content_type,
                 capture.original_bytes,
                 capture.body_sha256,
-                zlib.compress(stored),
+                body_zlib,
                 "zlib+raw-prefix",
                 int(capture.truncated),
                 capture.original_bytes,
@@ -355,8 +400,13 @@ class RequestAuditStore:
         ordinal: int = 0,
         max_bytes: int | None = None,
     ) -> None:
-        capture = AuditBodyCapture(self.cfg.max_body_bytes if max_bytes is None else max_bytes)
+        limit = self.cfg.max_body_bytes if max_bytes is None else max_bytes
+        capture = AuditBodyCapture(
+            limit,
+            zero_is_unlimited=stage in {"client_request_body", "upstream_request_body"},
+        )
         capture.add(body)
+        body_zlib = zlib.compress(capture.stored_body)
         with self._lock, self._conn:
             self._insert_capture_locked(
                 audit_id=audit_id,
@@ -364,6 +414,48 @@ class RequestAuditStore:
                 ordinal=ordinal,
                 content_type=content_type,
                 capture=capture,
+                body_zlib=body_zlib,
+            )
+
+    def record_client_body(
+        self,
+        audit_id: int,
+        *,
+        body: bytes,
+        content_type: str | None = None,
+    ) -> None:
+        """Persist the canonical client body artifact and finalize its metadata."""
+        capture = AuditBodyCapture(self.cfg.max_body_bytes, zero_is_unlimited=True)
+        capture.add(body)
+        body_zlib = zlib.compress(capture.stored_body)
+        with self._lock, self._conn:
+            self._insert_capture_locked(
+                audit_id=audit_id,
+                stage="client_request_body",
+                ordinal=0,
+                content_type=content_type,
+                capture=capture,
+                body_zlib=body_zlib,
+            )
+            self._conn.execute(
+                """
+                UPDATE request_audit
+                SET updated_at = ?,
+                    raw_body_zlib = NULL,
+                    raw_body_encoding = ?,
+                    raw_body_truncated = ?,
+                    raw_body_original_bytes = ?,
+                    raw_body_stored_bytes = ?
+                WHERE id = ?
+                """,
+                (
+                    _now(),
+                    "request_audit_bodies:client_request_body",
+                    int(capture.truncated),
+                    capture.original_bytes,
+                    capture.stored_bytes,
+                    audit_id,
+                ),
             )
 
     def record_captured_body(
@@ -375,6 +467,7 @@ class RequestAuditStore:
         content_type: str | None = None,
         ordinal: int = 0,
     ) -> None:
+        body_zlib = zlib.compress(capture.stored_body)
         with self._lock, self._conn:
             self._insert_capture_locked(
                 audit_id=audit_id,
@@ -382,7 +475,46 @@ class RequestAuditStore:
                 ordinal=ordinal,
                 content_type=content_type,
                 capture=capture,
+                body_zlib=body_zlib,
             )
+
+    def record_body_failure(
+        self,
+        audit_id: int,
+        *,
+        stage: str,
+        ordinal: int,
+        operation: str,
+        error: str,
+        attempts: int,
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO request_audit_failures (
+                    audit_id, stage, ordinal, created_at, operation, error, attempts
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    audit_id,
+                    stage,
+                    max(0, int(ordinal)),
+                    _now(),
+                    operation,
+                    error[:1000],
+                    max(1, int(attempts)),
+                ),
+            )
+            if stage == "client_request_body":
+                self._conn.execute(
+                    """
+                    UPDATE request_audit
+                    SET updated_at = ?, raw_body_encoding = ?
+                    WHERE id = ?
+                    """,
+                    (_now(), "failed:client_request_body", audit_id),
+                )
 
     def should_record_response_body(self, status_code: int | None, *, force: bool = False) -> bool:
         mode_value: Any = self.cfg.store_response_body
@@ -423,11 +555,22 @@ class RequestAuditStore:
         raw_body: bytes,
         body: dict[str, Any] | None,
         parse_error: str | None,
+        store_body_inline: bool = True,
     ) -> int:
         created = _now()
-        raw_prefix = raw_body[: max(0, int(self.cfg.max_body_bytes))]
-        raw_body_zlib = zlib.compress(raw_prefix) if self.cfg.store_body else None
-        body_truncated = int(len(raw_prefix) < len(raw_body))
+        should_store_inline = bool(self.cfg.store_body and store_body_inline)
+        capture = AuditBodyCapture(self.cfg.max_body_bytes, zero_is_unlimited=True)
+        if should_store_inline:
+            capture.add(raw_body)
+        client_body_zlib = zlib.compress(capture.stored_body) if should_store_inline else None
+        body_truncated = int(capture.truncated if should_store_inline else bool(raw_body))
+        raw_body_encoding = None
+        if self.cfg.store_body:
+            raw_body_encoding = (
+                "request_audit_bodies:client_request_body"
+                if should_store_inline
+                else "pending:request_audit_bodies:client_request_body"
+            )
         input_items = body.get("input") if isinstance(body, dict) else None
         tools = body.get("tools") if isinstance(body, dict) else None
         input_rows, findings = self._input_rows(input_items)
@@ -467,11 +610,11 @@ class RequestAuditStore:
                     int(bool(body.get("stream"))) if isinstance(body, dict) else None,
                     len(raw_body),
                     _sha_bytes(raw_body),
-                    raw_body_zlib,
-                    "zlib+raw-prefix" if raw_body_zlib is not None else None,
+                    None,
+                    raw_body_encoding,
                     body_truncated,
                     len(raw_body),
-                    len(raw_prefix) if raw_body_zlib is not None else 0,
+                    capture.stored_bytes if should_store_inline else 0,
                     parse_error,
                     _json(sorted(str(k) for k in body.keys())) if isinstance(body, dict) else None,
                     len(input_items) if isinstance(input_items, list) else None,
@@ -481,15 +624,14 @@ class RequestAuditStore:
                 ),
             )
             audit_id = int(cur.lastrowid)
-            if self.cfg.store_body:
-                capture = AuditBodyCapture(self.cfg.max_body_bytes)
-                capture.add(raw_body)
+            if should_store_inline:
                 self._insert_capture_locked(
                     audit_id=audit_id,
                     stage="client_request_body",
                     ordinal=0,
                     content_type=content_type,
                     capture=capture,
+                    body_zlib=client_body_zlib,
                 )
             self._conn.executemany(
                 """

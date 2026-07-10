@@ -11,6 +11,8 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import zlib
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -20,13 +22,23 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 sys.path.insert(0, str(ROOT))
 
+import httpx
+import middleware.audit as audit_module
 from starlette.datastructures import Headers
 
 from middleware.app import (
+    ResponseBodyTooLarge,
+    _AuditBodyWriter,
+    _canonical_origin,
     _make_client,
     _model_allowed_to_fold,
+    _read_response_body,
+    _response_raw_headers,
     _resolve_upstream_url,
+    _upstream_url_error,
     _url_is_from_header,
+    _validate_config,
+    create_app,
 )
 from middleware.audit import AuditBodyCapture, RequestAuditStore
 from middleware.codex import (
@@ -39,7 +51,7 @@ from middleware.codex import (
 )
 from middleware.compat import normalize_request_body
 from middleware.config import CompatCfg, RequestLogCfg, load_config
-from middleware.creds import build_upstream_headers, would_inject_authorization
+from middleware.creds import build_upstream_headers
 from middleware.proxy import fold_stream
 from middleware.sse import DONE, incremental_sse
 from middleware.store import IdStore
@@ -390,6 +402,77 @@ async def test_commentary_continuation_payload():
           not any((e.get("item") or {}).get("phase") == "commentary" for e in evs))
 
 
+async def test_continuation_error_body_limits():
+    cfg = load_config(ROOT / "config.toml")
+    cfg = replace(
+        cfg,
+        stream=replace(
+            cfg.stream,
+            upstream_error_body_max_bytes=8,
+            upstream_error_body_timeout_seconds=0.03,
+        ),
+    )
+    base_body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "q"}]}
+
+    async def run_error(
+        error_response: FakeResp,
+        active_cfg=cfg,
+    ) -> tuple[list[dict], list[tuple[bytes, bool]]]:
+        captures: list[tuple[bytes, bool]] = []
+
+        async def audit_error(
+            round_no: int,
+            status_code: int | None,
+            content_type: str | None,
+            body: bytes,
+            force: bool,
+        ) -> None:
+            captures.append((body, force))
+
+        first = FakeResp(_round("rs_limit", "ENC_LIMIT", 516, msg="trunc"))
+        client = FakeClient([error_response])
+        out = b""
+        async for chunk in fold_stream(
+            client,
+            active_cfg,
+            base_body,
+            {},
+            first,
+            audit_upstream_response_bytes=audit_error,
+        ):
+            out += chunk
+        events = [event for event in await parse_events(out) if isinstance(event, dict)]
+        return events, captures
+
+    large_error = FakeResp(b"x" * 32, status=502, chunk=4)
+    events, captures = await run_error(large_error)
+    check("continuation error body is capped",
+          captures == [(b"x" * 8, True)], str(captures))
+    reason = (((events[-1].get("response") or {}).get("incomplete_details") or {})
+              .get("reason"))
+    check("continuation large error remains incomplete", reason == "upstream_error", str(reason))
+
+    slow_error = SlowKeepaliveResp(b"err", delay=0.01)
+    slow_error.status_code = 502
+    timeout_cfg = replace(
+        cfg,
+        stream=replace(cfg.stream, upstream_error_body_max_bytes=1024),
+    )
+    started = time.perf_counter()
+    timeout_events, timeout_captures = await asyncio.wait_for(
+        run_error(slow_error, timeout_cfg), timeout=0.5
+    )
+    elapsed = time.perf_counter() - started
+    timeout_reason = (((timeout_events[-1].get("response") or {}).get("incomplete_details") or {})
+                      .get("reason"))
+    check("continuation error body has total timeout",
+          elapsed < 0.2 and timeout_reason == "upstream_error",
+          str((elapsed, timeout_reason)))
+    check("continuation timeout audits captured prefix",
+          bool(timeout_captures) and timeout_captures[0][0].startswith(b"err"),
+          str(timeout_captures))
+
+
 async def test_tool_pair_continuation_payload():
     base = load_config(ROOT / "config.toml")
     cfg = replace(base, cont=replace(base.cont, method="tool_pair"))
@@ -610,56 +693,6 @@ def test_upstream_url_resolution():
           _resolve_upstream_url(req, _Req({"Responses-API-Base": " "})) is None)
 
 
-# --- security guard: never send config creds to a header-supplied URL --------
-
-
-def test_auth_safety_guard():
-    base = load_config(ROOT / "config.toml")
-
-    def blocked(url_mode, auth_mode, token, has_hdr, has_auth):
-        cfg = replace(
-            base,
-            upstream=replace(base.upstream, mode=url_mode),
-            auth=replace(base.auth, mode=auth_mode, access_token=token),
-        )
-        h = {}
-        if has_hdr:
-            h["Responses-API-Base"] = "https://external/responses"
-        if has_auth:
-            h["Authorization"] = "Bearer agent"
-        rq = _Req(h)
-        from_hdr = _url_is_from_header(cfg, rq)
-        inj = would_inject_authorization(
-            cfg, agent_has_authorization=rq.headers.get("authorization") is not None
-        )
-        return from_hdr and inj  # the exact condition handle_responses rejects on
-
-    # fixed url → always safe
-    check("guard: fixed+inject allow", not blocked("fixed", "inject", "TOK", True, False))
-    # header + passthrough → never injects → allow
-    check("guard: header+passthrough allow",
-          not blocked("header", "passthrough", "TOK", True, False))
-    # header + inject + header present → block (even if agent has its own auth)
-    check("guard: header+inject+hdr block (noauth)",
-          blocked("header", "inject", "TOK", True, False))
-    check("guard: header+inject+hdr block (auth)",
-          blocked("header", "inject", "TOK", True, True))
-    # header + inject, no header → config url → allow
-    check("guard: header+inject no-hdr allow",
-          not blocked("header", "inject", "TOK", False, False))
-    # header + PtI + header + agent has own auth → allow (uses agent's)
-    check("guard: header+PtI+hdr+auth allow",
-          not blocked("header", "passthrough_then_inject", "TOK", True, True))
-    # header + PtI + header + no agent auth → block (would inject config)
-    check("guard: header+PtI+hdr+noauth block",
-          blocked("header", "passthrough_then_inject", "TOK", True, False))
-    # header_required + inject + header → block
-    check("guard: required+inject+hdr block",
-          blocked("header_required", "inject", "TOK", True, False))
-    # empty configured token → nothing to leak → allow
-    check("guard: empty token allow", not blocked("header", "inject", "", True, False))
-
-
 # --- auth injection from config (#2 follow-up) ------------------------------
 
 
@@ -692,6 +725,185 @@ def test_auth_injection():
                                       access_token="TOK", chatgpt_account_id="acct1"))
     out4 = hdrs(cfg3, [("x", "1")])
     check("passthrough never injects", "authorization" not in out4 and "chatgpt-account-id" not in out4)
+
+
+async def test_transport_security_and_limits():
+    base = load_config(ROOT / "config.toml")
+
+    timeout_cfg = replace(
+        base,
+        stream=replace(
+            base.stream,
+            upstream_connect_timeout_seconds=5,
+            upstream_read_timeout_seconds=330,
+            upstream_write_timeout_seconds=60,
+            upstream_pool_timeout_seconds=5,
+        ),
+    )
+    client = _make_client(timeout_cfg)
+    check("httpx connect timeout configured", client.timeout.connect == 5)
+    check("httpx read timeout configured", client.timeout.read == 330)
+    check("httpx write timeout configured", client.timeout.write == 60)
+    check("httpx pool timeout configured", client.timeout.pool == 5)
+    check("httpx redirects disabled", not client.follow_redirects)
+    await client.aclose()
+
+    limited = replace(
+        base,
+        server=replace(base.server, max_request_body_bytes=8),
+        request_log=replace(base.request_log, enabled=False),
+    )
+    app = create_app(limited)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as test_client:
+            response = await test_client.post("/v1/responses", content=b"123456789")
+    check("application body limit returns 413", response.status_code == 413, str(response.status_code))
+    check("application body limit reports cap", response.json().get("max_bytes") == 8)
+
+    check(
+        "canonical origin normalizes default port",
+        _canonical_origin("HTTPS://API.OPENAI.COM:443/v1/responses")
+        == ("https://api.openai.com", "api.openai.com", 443),
+    )
+    check("canonical origin rejects userinfo", _canonical_origin("https://u:p@example.com") is None)
+    check("canonical origin rejects query", _canonical_origin("https://example.com?v=1") is None)
+    check("canonical origin rejects port zero", _canonical_origin("https://example.com:0") is None)
+    check(
+        "canonical origin uses httpx IDNA",
+        _canonical_origin("https://faß.de")
+        == ("https://xn--fa-hia.de", "xn--fa-hia.de", 443),
+    )
+    check(
+        "fixed upstream query remains supported",
+        await _upstream_url_error(
+            base,
+            "https://example.com/v1/responses?api-version=2026-01-01",
+            from_header=False,
+        )
+        is None,
+    )
+
+    dynamic = replace(
+        base,
+        upstream=replace(
+            base.upstream,
+            mode="header",
+            dynamic_allowed_origins=("https://8.8.8.8", "http://127.0.0.1:13080"),
+        ),
+    )
+    check(
+        "dynamic public origin allowed",
+        await _upstream_url_error(dynamic, "https://8.8.8.8/v1/responses", from_header=True)
+        is None,
+    )
+    private_error = await _upstream_url_error(
+        dynamic, "http://127.0.0.1:13080/v1/responses", from_header=True
+    )
+    check("dynamic private origin blocked", private_error is not None, str(private_error))
+    check(
+        "dynamic origin must be allowlisted",
+        await _upstream_url_error(dynamic, "https://1.1.1.1/v1/responses", from_header=True)
+        == "dynamic upstream origin is not allowed",
+    )
+    idna_cfg = replace(
+        dynamic,
+        upstream=replace(dynamic.upstream, dynamic_allowed_origins=("https://fass.de",)),
+    )
+    check(
+        "dynamic IDNA cannot alias another allowlisted host",
+        await _upstream_url_error(idna_cfg, "https://faß.de/responses", from_header=True)
+        == "dynamic upstream origin is not allowed",
+    )
+
+    credential_cfg = replace(
+        base,
+        auth=replace(base.auth, mode="inject", access_token="CONFIG", chatgpt_account_id="acct-config"),
+        upstream=replace(base.upstream, headers={"X-API-Key": "CONFIG-KEY"}),
+    )
+    isolated = {
+        k.lower(): v
+        for k, v in build_upstream_headers(
+            [
+                ("Authorization", "Bearer caller"),
+                ("chatgpt-account-id", "acct-caller"),
+                ("X-API-Key", "CALLER-KEY"),
+            ],
+            credential_cfg,
+            allow_config_credentials=False,
+        ).items()
+    }
+    check("dynamic keeps caller authorization", isolated.get("authorization") == "Bearer caller")
+    check("dynamic keeps caller account", isolated.get("chatgpt-account-id") == "acct-caller")
+    check("dynamic skips configured upstream headers", isolated.get("x-api-key") == "CALLER-KEY")
+    connection_filtered = {
+        k.lower(): v
+        for k, v in build_upstream_headers(
+            [("Connection", "X-Private"), ("X-Private", "drop"), ("X-Keep", "ok")],
+            base,
+        ).items()
+    }
+    check("request drops connection-named header", "x-private" not in connection_filtered)
+    check("request keeps end-to-end header", connection_filtered.get("x-keep") == "ok")
+
+    raw = _response_raw_headers(
+        Headers(
+            raw=[
+                (b"content-type", b"application/json"),
+                (b"retry-after", b"3"),
+                (b"x-ratelimit-remaining-requests", b"9"),
+                (b"set-cookie", b"a=1"),
+                (b"set-cookie", b"b=2"),
+                (b"connection", b"x-private"),
+                (b"x-private", b"drop"),
+                (b"content-encoding", b"gzip"),
+                (b"content-length", b"999"),
+            ]
+        )
+    )
+    names = [name for name, _ in raw]
+    check("response keeps retry-after", (b"retry-after", b"3") in raw)
+    check("response keeps rate-limit headers", b"x-ratelimit-remaining-requests" in names)
+    check("response preserves duplicate headers", names.count(b"set-cookie") == 2, str(raw))
+    check("response drops connection-named header", b"x-private" not in names)
+    check("response drops decoded encoding", b"content-encoding" not in names)
+    check("response drops stale length", b"content-length" not in names)
+
+    try:
+        await _read_response_body(FakeResp(b"12345", chunk=2), 4)
+    except ResponseBodyTooLarge:
+        error_body_limited = True
+    else:
+        error_body_limited = False
+    check("upstream error body has byte cap", error_body_limited)
+
+    invalid_origin_cfg = replace(
+        base,
+        upstream=replace(base.upstream, dynamic_allowed_origins=("https://api.openai.com/v1",)),
+    )
+    try:
+        _validate_config(invalid_origin_cfg)
+    except ValueError:
+        invalid_origin_rejected = True
+    else:
+        invalid_origin_rejected = False
+    check("invalid configured dynamic origin fails startup", invalid_origin_rejected)
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "bad.toml"
+        path.write_text(
+            '[upstream]\ndynamic_allow_private_ips = "false"\n',
+            encoding="utf-8",
+        )
+        try:
+            load_config(path)
+        except ValueError:
+            invalid_bool_rejected = True
+        else:
+            invalid_bool_rejected = False
+    check("quoted private-IP boolean fails config load", invalid_bool_rejected)
 
 
 # --- 4-fix. reasoning/stream gating (#4) ------------------------------------
@@ -797,7 +1009,10 @@ def test_request_audit_store_records_schema():
         ).fetchone()
         check("audit request row inserted", req is not None)
         check("audit input_count", req["input_count"] == 5, str(req["input_count"]))
-        check("audit body stored compressed", req["raw_body_zlib"] is not None)
+        check("audit body avoids duplicate legacy blob", req["raw_body_zlib"] is None)
+        check("audit body points to canonical artifact",
+              req["raw_body_encoding"] == "request_audit_bodies:client_request_body",
+              str(req["raw_body_encoding"]))
         check("audit upstream status recorded", req["upstream_status_code"] == 502)
 
         body_rows = conn.execute(
@@ -818,6 +1033,10 @@ def test_request_audit_store_records_schema():
         check("audit stores upstream response body artifact",
               ("upstream_response_body", 1) in body_keys, str(body_keys))
         response_rows = [row for row in body_rows if row["stage"] == "upstream_response_body"]
+        client_rows = [row for row in body_rows if row["stage"] == "client_request_body"]
+        if client_rows:
+            check("audit client artifact is complete",
+                  zlib.decompress(client_rows[0]["body_zlib"]) == raw)
         if response_rows:
             row = response_rows[0]
             check("audit response artifact truncated",
@@ -884,6 +1103,149 @@ def test_request_audit_store_records_schema():
                   and rows["input[3].id"]["parsed_type"] == "string",
                   str([dict(row) for row in compat_rows]))
         conn.close()
+
+
+async def test_background_audit_body_writer():
+    completed: list[str] = []
+
+    def slow_write() -> None:
+        time.sleep(0.1)
+        completed.append("done")
+
+    writer = _AuditBodyWriter(1024)
+    started = time.perf_counter()
+    await writer.submit(slow_write, pending_bytes=1)
+    enqueue_elapsed = time.perf_counter() - started
+    check("background audit enqueue does not wait for write",
+          enqueue_elapsed < 0.05, str(enqueue_elapsed))
+    await writer.aclose()
+    check("background audit close drains writes", completed == ["done"], str(completed))
+
+    capture = AuditBodyCapture(0, zero_is_unlimited=True)
+    capture.add(b"complete-body")
+    check("zero audit limit stores complete body",
+          capture.stored_body == b"complete-body" and not capture.truncated)
+    response_capture = AuditBodyCapture(0)
+    response_capture.add(b"response-body")
+    check("zero response capture limit retains zero bytes",
+          response_capture.stored_body == b"" and response_capture.truncated)
+
+    oversized_done: list[str] = []
+
+    def oversized_write() -> None:
+        time.sleep(0.05)
+        oversized_done.append("done")
+
+    writer = _AuditBodyWriter(1)
+    started = time.perf_counter()
+    await writer.submit(oversized_write, pending_bytes=2)
+    oversized_elapsed = time.perf_counter() - started
+    check("oversized audit body bypasses bounded queue synchronously",
+          oversized_done == ["done"] and oversized_elapsed >= 0.04,
+          str((oversized_done, oversized_elapsed)))
+    await writer.aclose()
+
+
+async def test_background_audit_failure_is_persisted():
+    class AlwaysFailClientBodyStore(RequestAuditStore):
+        def record_client_body(self, audit_id: int, *, body: bytes,
+                               content_type: str | None = None) -> None:
+            raise OSError("simulated body write failure")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = RequestLogCfg(enabled=True, path="audit.sqlite3", store_body=True)
+        store = AlwaysFailClientBodyStore(cfg, Path(tmp))
+        audit_id = store.record_request(
+            trace_id="trace_failure",
+            request_id="req_failure",
+            method="POST",
+            path="/responses",
+            client_host=None,
+            user_agent=None,
+            content_type="application/json",
+            upstream_url=None,
+            decision="test",
+            raw_body=b"{}",
+            body={},
+            parse_error=None,
+            store_body_inline=False,
+        )
+        writer = _AuditBodyWriter(1024)
+        await writer.submit(
+            store.record_client_body,
+            audit_id,
+            body=b"{}",
+            content_type="application/json",
+            pending_bytes=2,
+        )
+        await writer.aclose()
+        store.close()
+
+        conn = sqlite3.connect(Path(tmp) / "audit.sqlite3")
+        failure = conn.execute(
+            "select stage, ordinal, operation, attempts from request_audit_failures where audit_id = ?",
+            (audit_id,),
+        ).fetchone()
+        encoding = conn.execute(
+            "select raw_body_encoding from request_audit where id = ?", (audit_id,)
+        ).fetchone()[0]
+        conn.close()
+        check("background audit failure is persisted",
+              failure == ("client_request_body", 0, "record_client_body", 2), str(failure))
+        check("background client failure clears pending state",
+              encoding == "failed:client_request_body", str(encoding))
+
+
+def test_audit_compression_does_not_hold_sqlite_lock():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = RequestLogCfg(enabled=True, path="audit.sqlite3", store_body=False)
+        store = RequestAuditStore(cfg, Path(tmp))
+        audit_id = store.record_request(
+            trace_id="trace_lock",
+            request_id="req_lock",
+            method="POST",
+            path="/responses",
+            client_host=None,
+            user_agent=None,
+            content_type="application/json",
+            upstream_url=None,
+            decision="test",
+            raw_body=b"{}",
+            body={},
+            parse_error=None,
+        )
+        compress_started = threading.Event()
+        release_compress = threading.Event()
+        update_done = threading.Event()
+        original_compress = audit_module.zlib.compress
+
+        def blocking_compress(data: bytes) -> bytes:
+            compress_started.set()
+            release_compress.wait(timeout=1)
+            return original_compress(data)
+
+        def write_body() -> None:
+            store.record_body(audit_id, stage="upstream_request_body", body=b"payload")
+
+        def update_response() -> None:
+            store.update_response(audit_id, downstream_status_code=200)
+            update_done.set()
+
+        audit_module.zlib.compress = blocking_compress
+        body_thread = threading.Thread(target=write_body)
+        update_thread = threading.Thread(target=update_response)
+        try:
+            body_thread.start()
+            check("audit compression test reached compressor", compress_started.wait(timeout=1))
+            update_thread.start()
+            check("audit compression does not hold SQLite lock",
+                  update_done.wait(timeout=0.1))
+        finally:
+            release_compress.set()
+            body_thread.join(timeout=1)
+            update_thread.join(timeout=1)
+            audit_module.zlib.compress = original_compress
+            store.close()
 
 
 def test_request_audit_retention_and_response_modes():
@@ -1493,17 +1855,21 @@ async def _main():
     await test_fold_real_captures()
     await test_truncated_tool_call_discarded()
     await test_commentary_continuation_payload()
+    await test_continuation_error_body_limits()
     await test_tool_pair_continuation_payload()
     await test_fold_upstream_response_capture_callback()
     await test_forward_marker_emits_downstream()
     await test_low_reasoning_retry_after_continue()
     test_header_transparency()
     test_upstream_url_resolution()
-    test_auth_safety_guard()
     test_auth_injection()
+    await test_transport_security_and_limits()
     test_reasoning_gate()
     test_model_prefix_gate()
     test_request_audit_store_records_schema()
+    await test_background_audit_body_writer()
+    await test_background_audit_failure_is_persisted()
+    test_audit_compression_does_not_hold_sqlite_lock()
     test_request_audit_retention_and_response_modes()
     test_compat_normalizes_input_arguments_safely()
     test_stateful_repair()

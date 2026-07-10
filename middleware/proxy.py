@@ -43,6 +43,39 @@ UpstreamCaptureAudit = Callable[[int, int | None, str | None, AuditBodyCapture],
 UpstreamBytesAudit = Callable[[int, int | None, str | None, bytes, bool], Awaitable[None]]
 
 
+class _ContinuationErrorBodyTooLarge(Exception):
+    pass
+
+
+async def _read_continuation_error_body(
+    response: httpx.Response,
+    *,
+    max_bytes: int,
+    timeout_seconds: float,
+) -> tuple[bytes, str | None]:
+    capture = AuditBodyCapture(max_bytes, zero_is_unlimited=True)
+
+    async def consume() -> None:
+        async for chunk in response.aiter_bytes():
+            capture.add(chunk)
+            if capture.truncated:
+                raise _ContinuationErrorBodyTooLarge
+
+    try:
+        if timeout_seconds > 0:
+            async with asyncio.timeout(timeout_seconds):
+                await consume()
+        else:
+            await consume()
+    except TimeoutError:
+        return capture.stored_body, "timeout"
+    except _ContinuationErrorBodyTooLarge:
+        return capture.stored_body, "too_large"
+    except httpx.HTTPError as exc:
+        return capture.stored_body, f"read_error:{exc}"
+    return capture.stored_body, None
+
+
 async def open_round(
     client: httpx.AsyncClient,
     url: str,
@@ -55,7 +88,7 @@ async def open_round(
     invent a Content-Type — it comes from the passed-through agent headers.
     """
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = client.build_request("POST", url, content=body, headers=headers, timeout=None)
+    req = client.build_request("POST", url, content=body, headers=headers)
     return await client.send(req, stream=True)
 
 
@@ -66,7 +99,7 @@ async def open_passthrough(
     headers: dict[str, str],
 ) -> httpx.Response:
     """Open a streaming upstream request forwarding the raw body unchanged."""
-    req = client.build_request("POST", url, content=raw_body, headers=headers, timeout=None)
+    req = client.build_request("POST", url, content=raw_body, headers=headers)
     return await client.send(req, stream=True)
 
 
@@ -691,18 +724,31 @@ async def fold_stream(
                     )
                 response = await open_round(client, url, payload, headers)
                 if response.status_code >= 400:
-                    body = await response.aread()
-                    if audit_upstream_response_bytes is not None:
-                        await audit_upstream_response_bytes(
-                            round_no + 1,
-                            response.status_code,
-                            response.headers.get("content-type"),
-                            body,
-                            True,
-                        )
-                    await response.aclose()
-                    log.warning("continuation trace=%s req=%s round %d failed: %s %s",
-                                trace, req, round_no + 1, response.status_code, body[:2000])
+                    body, read_failure = await _read_continuation_error_body(
+                        response,
+                        max_bytes=cfg.stream.upstream_error_body_max_bytes,
+                        timeout_seconds=cfg.stream.upstream_error_body_timeout_seconds,
+                    )
+                    try:
+                        if audit_upstream_response_bytes is not None:
+                            await audit_upstream_response_bytes(
+                                round_no + 1,
+                                response.status_code,
+                                response.headers.get("content-type"),
+                                body,
+                                True,
+                            )
+                    finally:
+                        await response.aclose()
+                    log.warning(
+                        "continuation trace=%s req=%s round %d failed: %s %s read_failure=%s",
+                        trace,
+                        req,
+                        round_no + 1,
+                        response.status_code,
+                        body[:2000],
+                        read_failure,
+                    )
                     log.info(
                         "done trace=%s req=%s: %d round(s) | %s | status=incomplete "
                         "stop=upstream_error elapsed=%.1fs",

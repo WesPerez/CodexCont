@@ -72,6 +72,7 @@ http://127.0.0.1:8787/v1/responses
 [upstream]
 url = "https://chatgpt.com/backend-api/codex/responses"
 mode = "header"
+dynamic_allowed_origins = ["https://api.openai.com", "https://chatgpt.com"]
 ```
 
 当 `mode = "header"` 时，请求头 `Responses-API-Base` 会覆盖配置中的 `url`；如果没有该请求头，则回退到配置的 Codex URL。
@@ -82,7 +83,7 @@ mode = "header"
 Responses-API-Base: https://api.openai.com/v1
 ```
 
-中间件会自动追加 `/responses`；如果传入值已经以 `/responses` 结尾，则保持不变。该控制头不会被继续转发到上游。
+中间件会自动追加 `/responses`；如果传入值已经以 `/responses` 结尾，则保持不变。该控制头不会被继续转发到上游。请求头指定的目标必须精确匹配 `dynamic_allowed_origins`；空列表表示禁用动态目标。解析到私网或回环地址时默认拒绝，只有显式设置 `dynamic_allow_private_ips = true` 才允许。
 
 ## 鉴权
 
@@ -101,7 +102,9 @@ chatgpt_account_id = ""            # 非空时作为 chatgpt-account-id 发送
 - `inject`：使用配置中的凭据设置/覆盖鉴权头。
 - `passthrough_then_inject`：调用方已有鉴权头则保留；没有时才用配置中的凭据补上。
 
-安全保护：如果请求使用 `Responses-API-Base` 指定了上游地址，中间件不会把配置中的凭据泄露到这个由请求方指定的 URL。如果当前鉴权模式会为该请求注入配置中的凭据，请求会被 `400` 拒绝。若要对每个请求动态指定上游并使用凭据，请让调用方自己携带 `Authorization`，并使用 `mode = "passthrough"` 或 `mode = "passthrough_then_inject"`。
+安全保护：请求使用 `Responses-API-Base` 时，配置中的 access token、account ID 和 `[upstream.headers]` 覆盖都不会应用到动态目标，只有调用方自己提供的请求头可以发送到白名单目标；目标支持时仍可使用无鉴权或非 Authorization 鉴权方式。
+
+`[server].max_request_body_bytes` 即使在绕过 Nginx 直连服务时也会限制请求正文。反向代理层也应设置上限；示例默认值为 32 MiB。
 
 不要提交密钥。`.gitignore` 已忽略 `rt.json` 和 `free_rt.json`；如果把 token 写入 `config.toml`，也请谨慎管理。
 
@@ -140,9 +143,13 @@ chatgpt_account_id = ""            # 非空时作为 chatgpt-account-id 发送
 [stream]
 upstream_event_timeout_seconds = 300
 upstream_round_timeout_seconds = 480
+upstream_connect_timeout_seconds = 5
+upstream_read_timeout_seconds = 330
+upstream_write_timeout_seconds = 60
+upstream_pool_timeout_seconds = 5
 ```
 
-SSE comment / keepalive 不算进展。触发超时后，中间件会发出 `response.incomplete`，其中 `incomplete_details.reason` 为 `"upstream_event_timeout"` 或 `"upstream_round_timeout"`，并且不会冲刷尚未被 terminal event 确认的暂定 message / tool 输出。
+SSE comment / keepalive 不算进展。触发超时后，中间件会发出 `response.incomplete`，其中 `incomplete_details.reason` 为 `"upstream_event_timeout"` 或 `"upstream_round_timeout"`，并且不会冲刷尚未被 terminal event 确认的暂定 message / tool 输出。传输层超时还会限制连接建立、响应头/原始读取、请求上传和连接池等待；首个上游请求超时返回 `504`，其他连接错误返回 `502`。
 
 ## 请求审计日志
 
@@ -153,8 +160,13 @@ SSE comment / keepalive 不算进展。触发超时后，中间件会发出 `res
 enabled = true
 path = "logs/request_audit.sqlite3"
 store_body = true
-max_body_bytes = 8388608
+max_body_bytes = 0
+background_body_writes = true
+background_max_pending_bytes = 134217728
 retention_days = 7
+sqlite_busy_timeout_ms = 5000
+prune_interval_seconds = 0
+prune_batch_size = 0
 store_forwarded_body = true
 store_response_body = "errors"
 max_response_body_bytes = 1048576
@@ -163,11 +175,20 @@ preview_chars = 240
 
 审计库会写入请求级元数据、压缩后的原始 body、逐项拆解的 `input[i]`、`tools[i]`，以及 schema findings。它不会保存 `Authorization` / `Cookie` 等请求头。`request_input_items` 表能直接看到每个历史项的 `type`、`name`、`arguments_type`、`arguments_json_type`，例如定位 `input[83].arguments` 是 `string` 还是 `object`。
 
-`request_audit_bodies` 会按阶段保存有上限的压缩正文：`client_request_body`、
+`max_body_bytes = 0` 表示完整保存请求正文；正数表示只保存对应字节数并将
+更大的正文标为截断。启用后台写入后，压缩和 SQLite 正文写入进入单一有界
+FIFO；队列积压时会回压，而不会静默丢失排障证据。
+单个 artifact 大于队列预算时会改为同步写入，不进入队列。正文写入失败会
+重试一次，并记录到 `request_audit_failures`。
+
+`request_audit_bodies` 会按阶段保存压缩正文：`client_request_body`、
 `upstream_request_body`、`upstream_response_body`、`downstream_response_body`。
 默认保存实际转发给上游的请求正文；响应正文默认只保存错误响应。临时需要排查成功流式
 SSE 时，把 `store_response_body` 改成 `"all"`。每次写入新审计记录时，会按
 `retention_days` 清理这个审计库里的旧主记录，子表通过 SQLite 外键级联删除。
+`sqlite_busy_timeout_ms` 限制审计写入等待数据库锁的时间；
+`prune_interval_seconds` 和 `prune_batch_size` 用来限制请求路径上的清理频率和
+单次删除量。生产环境建议使用较短的锁等待和有上限的周期性小批清理。
 
 ## 兼容性归一化
 

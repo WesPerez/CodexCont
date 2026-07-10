@@ -74,6 +74,7 @@ The example default configuration (`config.example.toml`, copied to `config.toml
 [upstream]
 url = "https://chatgpt.com/backend-api/codex/responses"
 mode = "header"
+dynamic_allowed_origins = ["https://api.openai.com", "https://chatgpt.com"]
 ```
 
 With `mode = "header"`, a `Responses-API-Base` request header overrides the configured `url`; when the header is absent, requests fall back to the configured Codex URL.
@@ -84,7 +85,7 @@ For example, to target a generic Responses-compatible endpoint, send:
 Responses-API-Base: https://api.openai.com/v1
 ```
 
-The middleware appends `/responses` unless the supplied value already ends with `/responses`. This control header is stripped before forwarding upstream.
+The middleware appends `/responses` unless the supplied value already ends with `/responses`. This control header is stripped before forwarding upstream. Header-selected targets must match an exact entry in `dynamic_allowed_origins`; an empty list disables dynamic targets. Private or loopback resolved addresses are rejected unless `dynamic_allow_private_ips = true`.
 
 ## Authentication
 
@@ -103,7 +104,9 @@ Modes:
 - `inject`: override/set auth headers from config.
 - `passthrough_then_inject`: keep caller auth when present, otherwise inject from config.
 
-Security guard: if a request supplies `Responses-API-Base`, the middleware will not leak configured credentials to that request-supplied URL. If the current auth mode would inject configured credentials for that request, it is rejected with `400`. To use per-request upstream overrides with credentials, pass the caller's own `Authorization` and use `mode = "passthrough"` or `mode = "passthrough_then_inject"`.
+Security guard: when a request supplies `Responses-API-Base`, configured access tokens, account IDs, and `[upstream.headers]` overrides are never applied. Only caller-supplied headers may reach the allowlisted dynamic target; unauthenticated and non-Authorization authentication schemes remain possible when the target supports them.
+
+`[server].max_request_body_bytes` provides an application-layer request cap even when the service is reached without Nginx. Keep the reverse proxy capped as well; the example default is 32 MiB.
 
 Do not commit secrets. `rt.json` and `free_rt.json` are ignored by `.gitignore`, and tokens in `config.toml` should be handled carefully.
 
@@ -142,9 +145,13 @@ Set `[stream].upstream_event_timeout_seconds` to cap how long one upstream round
 [stream]
 upstream_event_timeout_seconds = 300
 upstream_round_timeout_seconds = 480
+upstream_connect_timeout_seconds = 5
+upstream_read_timeout_seconds = 330
+upstream_write_timeout_seconds = 60
+upstream_pool_timeout_seconds = 5
 ```
 
-SSE comments/keepalives do not count as progress. On timeout, the middleware emits `response.incomplete` with `incomplete_details.reason = "upstream_event_timeout"` or `"upstream_round_timeout"` and does not flush unconfirmed tentative message/tool output.
+SSE comments/keepalives do not count as progress. On timeout, the middleware emits `response.incomplete` with `incomplete_details.reason = "upstream_event_timeout"` or `"upstream_round_timeout"` and does not flush unconfirmed tentative message/tool output. The transport timeouts also bound connection setup, response-header/raw-read waits, request upload, and connection-pool waits; first-request transport timeouts return `504`, while other connection errors return `502`.
 
 ## Request audit log
 
@@ -155,8 +162,13 @@ Enable the independent SQLite request audit database when diagnosing upstream `4
 enabled = true
 path = "logs/request_audit.sqlite3"
 store_body = true
-max_body_bytes = 8388608
+max_body_bytes = 0
+background_body_writes = true
+background_max_pending_bytes = 134217728
 retention_days = 7
+sqlite_busy_timeout_ms = 5000
+prune_interval_seconds = 0
+prune_batch_size = 0
 store_forwarded_body = true
 store_response_body = "errors"
 max_response_body_bytes = 1048576
@@ -165,13 +177,23 @@ preview_chars = 240
 
 The audit database stores request metadata, a compressed raw body, per-item `input[i]` rows, per-tool rows, and schema findings. It does not store `Authorization` / `Cookie` headers. The `request_input_items` table makes fields such as `input[83].arguments` directly queryable by `type`, `name`, `arguments_type`, and `arguments_json_type`.
 
-`request_audit_bodies` stores bounded compressed body artifacts by stage:
+`max_body_bytes = 0` stores complete request bodies. Positive values retain only
+that many bytes and mark larger bodies as truncated. With background writes
+enabled, compression and SQLite body writes use one bounded FIFO; queue pressure
+applies backpressure rather than silently dropping evidence. A single artifact
+larger than the queue budget is written synchronously instead of being queued.
+Failed body writes are retried once and recorded in `request_audit_failures`.
+
+`request_audit_bodies` stores compressed body artifacts by stage:
 `client_request_body`, `upstream_request_body`, `upstream_response_body`, and
 `downstream_response_body`. By default, forwarded upstream request bodies are
 stored, while response bodies are stored only for errors. Set
 `store_response_body = "all"` temporarily when you need successful streaming SSE
 prefixes as well. Rows older than `retention_days` are pruned from this audit DB
-on new writes; child rows are removed by SQLite foreign-key cascade.
+when a throttled prune pass is due. `sqlite_busy_timeout_ms` keeps diagnostic
+logging from waiting indefinitely behind another SQLite user;
+`prune_interval_seconds` and `prune_batch_size` bound cleanup work on the request
+path. Use a short busy timeout and bounded periodic batches on production hosts.
 
 ## Compatibility normalization
 
